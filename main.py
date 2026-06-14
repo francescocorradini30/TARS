@@ -49,19 +49,22 @@ class TARSAPI:
         stt_start()
 
     def stop_and_process(self) -> None:
+        t0 = time.perf_counter()
         text = stt_stop()
         if not text.strip():
             _window.evaluate_js("resetProcessing()")
             return
+        print(f"[STT] {text}")
         _window.evaluate_js(f"onTranscript({json.dumps(text)})")
-        self._run_pipeline(text)
+        self._run_pipeline(text, t0)
 
     def send_message(self, text: str) -> dict:
         self._run_pipeline(text)
         return {}
 
-    def _run_pipeline(self, text: str) -> None:
+    def _run_pipeline(self, text: str, t0: float | None = None) -> None:
         sentence_buffer = ""
+        first_audio = True
         _window.evaluate_js("startTarsStream()")
 
         for chunk in brain.chat_stream(text):
@@ -74,12 +77,18 @@ class TARSAPI:
                     break
                 audio_bytes = synthesize(sentence)
                 if audio_bytes:
+                    if first_audio and t0 is not None:
+                        print(f"[LATENCY] {time.perf_counter() - t0:.2f}s")
+                        first_audio = False
                     b64 = base64.b64encode(audio_bytes).decode()
                     _window.evaluate_js(f"queueAudio({json.dumps(b64)})")
 
         if sentence_buffer.strip():
             audio_bytes = synthesize(sentence_buffer.strip())
             if audio_bytes:
+                if first_audio and t0 is not None:
+                    print(f"[LATENCY] {time.perf_counter() - t0:.2f}s")
+                    first_audio = False
                 b64 = base64.b64encode(audio_bytes).decode()
                 _window.evaluate_js(f"queueAudio({json.dumps(b64)})")
 
