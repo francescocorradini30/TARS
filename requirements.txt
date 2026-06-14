@@ -1,0 +1,7 @@
+pywebview
+faster-whisper
+sounddevice
+numpy
+ollama
+elevenlabs
+python-dotenv

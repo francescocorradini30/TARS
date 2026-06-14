@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# pywebview browser data (permissions, cache)
+.webview_data/
+
+# ide
+.idea/
+.vscode/
+
+# whisper model cache
+~/.cache/huggingface/
