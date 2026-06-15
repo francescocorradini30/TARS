@@ -50,6 +50,16 @@ def _get_kokoro():
     return _kokoro
 
 
+def warmup() -> None:
+    """Force Kokoro to download/load the ONNX model and run a dummy synthesis
+    so the first real request doesn't pay the cold-start tax (~1.5-2s)."""
+    try:
+        _get_kokoro().create("Ready.", voice=KOKORO_VOICE, lang="en-us")
+        print("[TTS] Kokoro ready")
+    except Exception as e:
+        print(f"[TTS-WARMUP] {type(e).__name__}: {e}")
+
+
 def synthesize(text: str) -> bytes | None:
     text = text.strip()
     if not text:

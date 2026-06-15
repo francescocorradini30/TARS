@@ -25,6 +25,7 @@ for _dll_path in [
 
 import webview
 import core.stt as stt
+import core.tts as tts
 from core.llm import TARSBrain
 from core.tts import synthesize
 
@@ -55,11 +56,21 @@ def ensure_ollama():
     raise RuntimeError("Ollama did not start in time.")
 
 
-def _extract_sentence(buffer: str) -> tuple[str | None, str]:
+def _extract_sentence(buffer: str, allow_comma: bool = False) -> tuple[str | None, str]:
+    """Pull the next TTS-able chunk out of the streaming LLM buffer.
+    - Always splits on sentence-end punctuation (. ! ?).
+    - When allow_comma is set (used for the first chunk of a response), also
+      splits on , ; : once the buffer is long enough to make natural prosody.
+      This halves time-to-first-audio for long responses."""
     match = re.search(r'[.!?]["\']?\s', buffer)
     if match:
         end = match.end()
         return buffer[:end].strip(), buffer[end:]
+    if allow_comma and len(buffer) >= 25:
+        match = re.search(r'[,;:]\s', buffer)
+        if match:
+            end = match.end()
+            return buffer[:end].strip(), buffer[end:]
     return None, buffer
 
 
@@ -89,6 +100,7 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
         drain_thread = threading.Thread(target=drain, daemon=True)
         drain_thread.start()
 
+        first_chunk_pending = True
         try:
             for chunk in brain.chat_stream(text):
                 if stt.interrupt_event.is_set():
@@ -96,10 +108,13 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
                 sentence_buffer += chunk
                 full_response += chunk
                 while True:
-                    sentence, sentence_buffer = _extract_sentence(sentence_buffer)
+                    sentence, sentence_buffer = _extract_sentence(
+                        sentence_buffer, allow_comma=first_chunk_pending,
+                    )
                     if sentence is None:
                         break
                     future_queue.put(_tts_executor.submit(synthesize, sentence))
+                    first_chunk_pending = False
 
             if not stt.interrupt_event.is_set() and sentence_buffer.strip():
                 future_queue.put(_tts_executor.submit(synthesize, sentence_buffer.strip()))
@@ -111,9 +126,14 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
                       "(need 545+), 2) `ollama --version` (update if old), 3) free VRAM with "
                       "`nvidia-smi` — Whisper medium uses ~1.5GB, llama3.2:3b ~2.5GB.")
         finally:
-            future_queue.put(None)
-            drain_thread.join()
+            # Release pipeline_active FIRST so a queued interruption can resume
+            # immediately even if drain blocks. Then signal drain to stop and
+            # wait with a timeout so a stuck TTS can't hold the lock forever.
             stt.pipeline_active = False
+            future_queue.put(None)
+            drain_thread.join(timeout=10.0)
+            if drain_thread.is_alive():
+                print("[PIPELINE] drain thread still alive after 10s — abandoning, may leak audio")
             if stt.interrupt_event.is_set():
                 _window.evaluate_js("interruptStream()")
             else:
@@ -157,6 +177,9 @@ if __name__ == "__main__":
         brain.warmup()
     except Exception as e:
         print(f"[OLLAMA-WARMUP] {type(e).__name__}: {e}")
+    # Kokoro warmup in background — the model may need downloading (~350MB)
+    # on first run; we don't want to block window startup behind that.
+    threading.Thread(target=tts.warmup, daemon=True).start()
     ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
     _window = webview.create_window(
         title="TARS",

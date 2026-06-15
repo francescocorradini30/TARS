@@ -10,9 +10,11 @@ from config import WHISPER_MODEL, WHISPER_DEVICE
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
 ENERGY_THRESHOLD  = 0.012
-SILENCE_CHUNKS    = 15            # ~0.48s of silence ends an utterance
+SILENCE_CHUNKS    = 12            # ~0.38s of silence ends an utterance
 PRE_ROLL_CHUNKS   = 10            # ~0.32s pre-roll
 MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
+PIPELINE_WAIT_TIMEOUT = 10.0      # max seconds to wait for a running pipeline
+                                  # to finish before queueing an interruption
 
 # Addressee gating: English words = directed at TARS, Italian words = ignore.
 # Whisper's acoustic language detection mixes accent + content and fails in both
@@ -155,17 +157,21 @@ def _process_utterance(audio: np.ndarray, callback) -> None:
 
 
 def _delayed_submit(audio: np.ndarray, callback) -> None:
-    """Wait for the interrupted pipeline to finish, then transcribe and process."""
+    """Wait for the interrupted pipeline to finish, then transcribe and process.
+    Old 3s timeout was too short — long LLM/TTS responses meant interruption
+    utterances were silently dropped."""
     global _transcribing
-    deadline = time.time() + 3.0
+    deadline = time.time() + PIPELINE_WAIT_TIMEOUT
     while pipeline_active and time.time() < deadline:
         time.sleep(0.02)
-    if not pipeline_active:
-        _transcribing = True
-        _process_utterance(audio, callback)
+    if pipeline_active:
+        print(f"[STT] interruption dropped — pipeline still running after {PIPELINE_WAIT_TIMEOUT}s")
+        return
+    _transcribing = True
+    _process_utterance(audio, callback)
 
 
-def _listener_loop(callback) -> None:
+def _listener_loop_inner(callback) -> None:
     global _transcribing
 
     pre_buffer:    list = []
@@ -224,6 +230,18 @@ def _listener_loop(callback) -> None:
                         interrupted_this = False
                 else:
                     silence_count = 0
+
+
+def _listener_loop(callback) -> None:
+    """Supervisor that keeps the listener loop alive across audio device errors.
+    Without this, a single sounddevice exception killed the daemon thread and
+    TARS silently stopped hearing forever."""
+    while _running:
+        try:
+            _listener_loop_inner(callback)
+        except Exception as e:
+            print(f"[STT-LOOP-ERROR] {type(e).__name__}: {e} — restarting in 1s")
+            time.sleep(1)
 
 
 def _warmup() -> None:
