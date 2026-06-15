@@ -1,5 +1,6 @@
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -8,7 +9,7 @@ from config import WHISPER_MODEL, WHISPER_DEVICE
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
 ENERGY_THRESHOLD  = 0.012
-SILENCE_CHUNKS    = 25            # ~0.8s of silence ends an utterance
+SILENCE_CHUNKS    = 15            # ~0.48s of silence ends an utterance
 PRE_ROLL_CHUNKS   = 10            # ~0.32s pre-roll
 MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
 
@@ -22,8 +23,10 @@ MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
 # to ignoring when scores are close.
 LANG_MARGIN = 0.15
 
-# Whisper hallucinates these on silence/noise — discard before gating.
-_HALLUCINATIONS = {
+# Whisper hallucinates these on silence/noise, or transcribes filler voice
+# sounds as these tokens — discard before gating.
+_NOISE_TRANSCRIPTS = {
+    # YouTube-style hallucinations
     "thanks for watching",
     "thank you for watching",
     "thank you so much for watching",
@@ -31,16 +34,29 @@ _HALLUCINATIONS = {
     "thanks",
     "please subscribe",
     "subscribe",
-    "you",
     "bye",
     "okay",
     "ok",
+    # filler voice sounds
+    "hm", "hmm", "hmmm",
+    "uh", "uhh", "uhhh",
+    "uhm", "uhmm",
+    "um", "umm",
+    "mm", "mmm", "mmmm",
+    "mhm", "mhmm",
+    "ah", "ahh",
+    "eh", "ehh",
+    "er", "err",
+    "oh", "ohh",
+    "you",
     ".",
+    "..",
+    "...",
 }
 
 
-def _is_hallucination(text: str) -> bool:
-    return text.lower().strip(" .,!?") in _HALLUCINATIONS
+def _is_noise(text: str) -> bool:
+    return text.lower().strip(" .,!?-") in _NOISE_TRANSCRIPTS
 
 
 # interrupt_event: set by VAD when user speaks during the LLM/TTS pipeline.
@@ -52,6 +68,7 @@ pipeline_active: bool = False
 _model: WhisperModel | None = None
 _running: bool     = False
 _transcribing: bool = False   # True only during Whisper inference
+_transcribe_pool = ThreadPoolExecutor(max_workers=2)
 
 
 def _get_model() -> WhisperModel:
@@ -80,8 +97,12 @@ def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
 def _process_utterance(audio: np.ndarray, callback) -> None:
     global _transcribing
     try:
-        en_text, en_score = _transcribe(audio, 'en')
-        it_text, it_score = _transcribe(audio, 'it')
+        # Run both transcriptions in parallel — faster_whisper releases the GIL
+        # during ctranslate2 inference, so this overlaps the en/it passes.
+        en_future = _transcribe_pool.submit(_transcribe, audio, 'en')
+        it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
+        en_text, en_score = en_future.result()
+        it_text, it_score = it_future.result()
 
         # English must beat Italian by at least LANG_MARGIN. Ties (close scores)
         # are treated as Italian — common when Whisper "makes English fit"
@@ -90,7 +111,7 @@ def _process_utterance(audio: np.ndarray, callback) -> None:
             print(f"[STT-IGNORED] (en {en_score:.2f} vs it {it_score:.2f}) {it_text}")
             return
 
-        if not en_text or _is_hallucination(en_text):
+        if not en_text or _is_noise(en_text):
             return
         print(f"[STT-MSG] (en {en_score:.2f} > it {it_score:.2f}) {en_text}")
         callback(en_text)
@@ -170,9 +191,20 @@ def _listener_loop(callback) -> None:
                     silence_count = 0
 
 
+def _warmup() -> None:
+    """Run a dummy transcribe so the model is loaded + JIT warm before the
+    first real utterance. Saves the cold-start cost on the first interaction."""
+    dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
+    try:
+        _get_model().transcribe(dummy, language='en', beam_size=1)
+    except Exception:
+        pass
+
+
 def start_listener(callback) -> None:
     global _running
     _running = True
+    threading.Thread(target=_warmup, daemon=True).start()
     threading.Thread(target=_listener_loop, args=(callback,), daemon=True).start()
 
 
