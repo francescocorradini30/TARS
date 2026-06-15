@@ -16,3 +16,9 @@ __pycache__/
 
 # whisper model cache
 ~/.cache/huggingface/
+
+# kokoro models (downloaded at runtime)
+models/
+
+# project docs (local only)
+CLAUDE.md

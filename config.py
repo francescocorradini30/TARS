@@ -3,8 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "am_michael")
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b").split("=")[-1].strip()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")

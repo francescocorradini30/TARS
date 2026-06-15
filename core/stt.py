@@ -18,25 +18,28 @@ MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
 # Whisper's acoustic language detection mixes accent + content and fails in both
 # directions on short utterances, so instead we transcribe twice (forcing each
 # language) and pick whichever has higher avg_logprob — i.e. whichever language
-# the audio is most coherent in. English must win by at least LANG_MARGIN to
-# process: ties (within margin) on short accented utterances are often Italian
-# that Whisper "made fit" as English (e.g. "Only fools rushing"), so we default
-# to ignoring when scores are close.
-LANG_MARGIN = 0.15
+# the audio is most coherent in. We don't require any margin: if English fits
+# even slightly better, we process it. Previously a margin caused too many
+# accented-English utterances to be rejected (Whisper forced Italian produces
+# a "translation" of the English audio, scoring close enough to falsely tie).
 
 # Tiebreaker: when the English transcript mentions "TARS" (or common accented
 # mishearings), the user is clearly addressing the assistant — accept regardless
 # of how close the en/it logprobs are. Catches short greetings like "Hey TARS"
 # that fall in the margin gap.
 WAKE_RE = re.compile(
-    r'\b(?:tars?|tarz|tarce|tarso|tarsi|tarsh|thars?|tarus|taz|terz|tarcy)\b',
+    r'\b(?:'
+    r'tars?|tarz|tarce|tarso|tarsi|tarsh|thars?|tarus|tarcy|'  # T-initial variants
+    r'dars?|darz|darce|darso|darsi|darsh|dhars?|darus|darcy|'  # D-initial (Whisper softens T→D often)
+    r'taz|daz|terz|terce|derz|derce'                            # rarer mishearings
+    r')\b',
     re.I,
 )
 
 # Whisper hallucinates these on silence/noise, or transcribes filler voice
 # sounds as these tokens — discard before gating.
 _NOISE_TRANSCRIPTS = {
-    # YouTube-style hallucinations
+    # YouTube-style English hallucinations
     "thanks for watching",
     "thank you for watching",
     "thank you so much for watching",
@@ -47,6 +50,13 @@ _NOISE_TRANSCRIPTS = {
     "bye",
     "okay",
     "ok",
+    # Italian Whisper hallucinations (Amara/QTSS subtitle credits)
+    "sottotitoli creati dalla comunità amara.org",
+    "sottotitoli creati dalla comunita amara.org",
+    "sottotitoli e revisione a cura di qtss",
+    "sottotitoli a cura di",
+    "grazie per aver guardato",
+    "iscrivetevi al canale",
     # filler voice sounds
     "hm", "hmm", "hmmm",
     "uh", "uhh", "uhhh",
@@ -119,17 +129,22 @@ def _process_utterance(audio: np.ndarray, callback) -> None:
         if not en_text and not it_text:
             return
 
+        # Known Whisper hallucinations in either language → silent drop.
+        if _is_noise(en_text) and _is_noise(it_text):
+            return
+        if _is_noise(it_text) and it_score >= en_score:
+            return
+
         # Hard tiebreaker: "TARS" in the English transcript = clearly addressed
-        # to the assistant. Accept even when the en/it margin is tight.
+        # to the assistant. Accept regardless of which language scored higher.
         if en_text and WAKE_RE.search(en_text) and not _is_noise(en_text):
             callback(en_text)
             return
 
-        # English must beat Italian by at least LANG_MARGIN. Ties (close scores)
-        # are treated as Italian — common when Whisper "makes English fit"
-        # short Italian utterances by accident.
-        if en_score - it_score < LANG_MARGIN:
-            print(f"[STT-IGNORED] (en {en_score:.2f} vs it {it_score:.2f}) {it_text}")
+        # Italian fits the audio better → user spoke Italian → ignore.
+        # Log both transcripts so we can audit why Whisper picked Italian.
+        if it_score > en_score:
+            print(f"[STT-IGNORED] (en {en_score:.2f}: '{en_text}' | it {it_score:.2f}: '{it_text}')")
             return
 
         if not en_text or _is_noise(en_text):

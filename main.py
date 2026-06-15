@@ -104,7 +104,12 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
             if not stt.interrupt_event.is_set() and sentence_buffer.strip():
                 future_queue.put(_tts_executor.submit(synthesize, sentence_buffer.strip()))
         except Exception as e:
-            print(f"[PIPELINE-ERROR] {type(e).__name__}: {e}")
+            msg = str(e)
+            print(f"[PIPELINE-ERROR] {type(e).__name__}: {msg[:300]}")
+            if 'CUDA error' in msg or 'cuda' in msg.lower():
+                print("[HINT] Ollama GPU runner failed. Check: 1) `nvidia-smi` driver version "
+                      "(need 545+), 2) `ollama --version` (update if old), 3) free VRAM with "
+                      "`nvidia-smi` — Whisper medium uses ~1.5GB, llama3.2:3b ~2.5GB.")
         finally:
             future_queue.put(None)
             drain_thread.join()
@@ -144,6 +149,14 @@ class TARSAPI:
 
 if __name__ == "__main__":
     ensure_ollama()
+    # Load llama runner into GPU BEFORE Whisper takes the CUDA context.
+    # Reverse order triggers "shared object initialization failed" on the
+    # llama runner because Whisper holds the GPU first.
+    print("[OLLAMA] warming up llama runner on GPU...")
+    try:
+        brain.warmup()
+    except Exception as e:
+        print(f"[OLLAMA-WARMUP] {type(e).__name__}: {e}")
     ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
     _window = webview.create_window(
         title="TARS",

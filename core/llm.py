@@ -22,3 +22,8 @@ class TARSBrain:
 
     def reset(self):
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    def warmup(self):
+        """Force Ollama to load the model into GPU memory now, before Whisper
+        grabs CUDA. Doesn't touch history. Blocks ~1-2s on first call."""
+        self.client.generate(model=OLLAMA_MODEL, prompt="hi", options={"num_predict": 1})
