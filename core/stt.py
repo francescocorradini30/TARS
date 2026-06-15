@@ -1,3 +1,4 @@
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,15 @@ MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
 # that Whisper "made fit" as English (e.g. "Only fools rushing"), so we default
 # to ignoring when scores are close.
 LANG_MARGIN = 0.15
+
+# Tiebreaker: when the English transcript mentions "TARS" (or common accented
+# mishearings), the user is clearly addressing the assistant — accept regardless
+# of how close the en/it logprobs are. Catches short greetings like "Hey TARS"
+# that fall in the margin gap.
+WAKE_RE = re.compile(
+    r'\b(?:tars?|tarz|tarce|tarso|tarsi|tarsh|thars?|tarus|taz|terz|tarcy)\b',
+    re.I,
+)
 
 # Whisper hallucinates these on silence/noise, or transcribes filler voice
 # sounds as these tokens — discard before gating.
@@ -104,6 +114,17 @@ def _process_utterance(audio: np.ndarray, callback) -> None:
         en_text, en_score = en_future.result()
         it_text, it_score = it_future.result()
 
+        # Both empty → Whisper's internal VAD rejected the audio as non-speech.
+        # Silently drop, no log spam.
+        if not en_text and not it_text:
+            return
+
+        # Hard tiebreaker: "TARS" in the English transcript = clearly addressed
+        # to the assistant. Accept even when the en/it margin is tight.
+        if en_text and WAKE_RE.search(en_text) and not _is_noise(en_text):
+            callback(en_text)
+            return
+
         # English must beat Italian by at least LANG_MARGIN. Ties (close scores)
         # are treated as Italian — common when Whisper "makes English fit"
         # short Italian utterances by accident.
@@ -113,7 +134,6 @@ def _process_utterance(audio: np.ndarray, callback) -> None:
 
         if not en_text or _is_noise(en_text):
             return
-        print(f"[STT-MSG] (en {en_score:.2f} > it {it_score:.2f}) {en_text}")
         callback(en_text)
     finally:
         _transcribing = False

@@ -68,54 +68,63 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
         stt.interrupt_event.clear()
         stt.pipeline_active = True
         sentence_buffer = ""
-        first_audio = True
+        full_response = ""
+        first_audio_t: float | None = None
         future_queue: queue.Queue = queue.Queue()
         _window.evaluate_js("startTarsStream()")
 
         def drain():
-            nonlocal first_audio
+            nonlocal first_audio_t
             while True:
                 future = future_queue.get()
                 if future is None:
                     break
                 audio_bytes = future.result()
                 if audio_bytes and not stt.interrupt_event.is_set():
-                    if first_audio and t0 is not None:
-                        print(f"[LATENCY] {time.perf_counter() - t0:.2f}s")
-                        first_audio = False
+                    if first_audio_t is None and t0 is not None:
+                        first_audio_t = time.perf_counter() - t0
                     b64 = base64.b64encode(audio_bytes).decode()
                     _window.evaluate_js(f"queueAudio({json.dumps(b64)})")
 
         drain_thread = threading.Thread(target=drain, daemon=True)
         drain_thread.start()
 
-        for chunk in brain.chat_stream(text):
-            if stt.interrupt_event.is_set():
-                break
-            sentence_buffer += chunk
-            _window.evaluate_js(f"appendTarsText({json.dumps(chunk)})")
-            while True:
-                sentence, sentence_buffer = _extract_sentence(sentence_buffer)
-                if sentence is None:
+        try:
+            for chunk in brain.chat_stream(text):
+                if stt.interrupt_event.is_set():
                     break
-                future_queue.put(_tts_executor.submit(synthesize, sentence))
+                sentence_buffer += chunk
+                full_response += chunk
+                while True:
+                    sentence, sentence_buffer = _extract_sentence(sentence_buffer)
+                    if sentence is None:
+                        break
+                    future_queue.put(_tts_executor.submit(synthesize, sentence))
 
-        if not stt.interrupt_event.is_set() and sentence_buffer.strip():
-            future_queue.put(_tts_executor.submit(synthesize, sentence_buffer.strip()))
+            if not stt.interrupt_event.is_set() and sentence_buffer.strip():
+                future_queue.put(_tts_executor.submit(synthesize, sentence_buffer.strip()))
+        except Exception as e:
+            print(f"[PIPELINE-ERROR] {type(e).__name__}: {e}")
+        finally:
+            future_queue.put(None)
+            drain_thread.join()
+            stt.pipeline_active = False
+            if stt.interrupt_event.is_set():
+                _window.evaluate_js("interruptStream()")
+            else:
+                _window.evaluate_js("endTarsStream()")
 
-        future_queue.put(None)
-        drain_thread.join()
-
-        stt.pipeline_active = False
-        if stt.interrupt_event.is_set():
-            _window.evaluate_js("interruptStream()")
-        else:
-            _window.evaluate_js("endTarsStream()")
+        response = full_response.strip()
+        if response:
+            if first_audio_t is not None:
+                print(f"[TARS] ({first_audio_t:.2f}s) {response}")
+            else:
+                print(f"[TARS] {response}")
 
 
 def _on_utterance(text: str) -> None:
     t0 = time.perf_counter()
-    _window.evaluate_js(f"onTranscript({json.dumps(text)})")
+    print(f"[YOU] {text}")
     _run_pipeline(text, t0)
 
 
@@ -140,10 +149,10 @@ if __name__ == "__main__":
         title="TARS",
         url=ui_path,
         js_api=TARSAPI(),
-        width=960,
-        height=640,
+        width=300,
+        height=560,
         resizable=True,
-        min_size=(700, 480),
+        min_size=(260, 480),
         background_color="#060608",
     )
     _window.events.loaded += _on_window_loaded

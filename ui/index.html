@@ -7,54 +7,34 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="app">
+    <div class="tars-panel">
+        <div class="logo">T &nbsp; A &nbsp; R &nbsp; S</div>
 
-        <!-- Left: TARS visualization -->
-        <div class="tars-panel">
-            <div class="logo">T &nbsp; A &nbsp; R &nbsp; S</div>
-
-            <div class="tars-body" id="tarsBody">
-                <div class="segment">
-                    <div class="panel-line"></div>
-                    <div class="panel-line"></div>
-                    <div class="panel-line short"></div>
-                </div>
-                <div class="core">
-                    <div class="waveform" id="waveform"></div>
-                    <div class="eye" id="eye"></div>
-                </div>
-                <div class="segment">
-                    <div class="panel-line short"></div>
-                    <div class="panel-line"></div>
-                    <div class="panel-line"></div>
-                </div>
+        <div class="tars-body" id="tarsBody">
+            <div class="segment">
+                <div class="panel-line"></div>
+                <div class="panel-line"></div>
+                <div class="panel-line short"></div>
             </div>
-
-            <div class="status-text" id="statusText">DORMANT</div>
-
-            <div class="readout">
-                <div>HUMOR &nbsp;<span class="fill">████████████░░░░</span> 75%</div>
-                <div>HONESTY <span class="fill">██████████████░</span> 90%</div>
+            <div class="core">
+                <div class="waveform" id="waveform"></div>
+                <div class="eye" id="eye"></div>
             </div>
-
-            <button class="reset-btn" id="resetBtn">RESET MEMORY</button>
-        </div>
-
-        <!-- Right: Chat -->
-        <div class="chat-panel">
-            <div class="chat-log" id="chatLog">
-                <div class="message tars">
-                    <div class="sender">TARS</div>
-                    <div class="content">Online. Speak English to talk to me.</div>
-                </div>
-            </div>
-
-            <div class="input-row">
-                <input type="text" id="textInput" placeholder="type here..." autocomplete="off" spellcheck="false">
-                <button id="sendBtn">SEND</button>
+            <div class="segment">
+                <div class="panel-line short"></div>
+                <div class="panel-line"></div>
+                <div class="panel-line"></div>
             </div>
         </div>
 
+        <div class="status-text" id="statusText">STANDBY</div>
+
+        <div class="readout">
+            <div>HUMOR &nbsp;<span class="fill">████████████░░░░</span> 75%</div>
+            <div>HONESTY <span class="fill">██████████████░</span> 90%</div>
+        </div>
+
+        <button class="reset-btn" id="resetBtn">RESET MEMORY</button>
     </div>
     <script src="app.js"></script>
 </body>

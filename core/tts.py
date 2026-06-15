@@ -23,5 +23,9 @@ def synthesize(text: str) -> bytes | None:
         )
         return b"".join(chunks)
     except Exception as e:
-        print(f"[TTS] error: {e}")
+        msg = str(e)
+        if 'quota_exceeded' in msg:
+            print("[TTS] ElevenLabs quota exceeded — top up at elevenlabs.io")
+        else:
+            print(f"[TTS] {type(e).__name__}: {msg[:200]}")
         return None
