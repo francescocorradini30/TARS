@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import json
 import os
 import queue
@@ -11,28 +12,26 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # Pre-load CUDA 12 DLLs installed via pip so ctranslate2 finds them via LoadLibrary
-import ctypes
-# sys.executable = .venv\Scripts\python.exe → go up two levels to reach venv root
 _venv_root = os.path.dirname(os.path.dirname(sys.executable))
 _nvidia_base = os.path.join(_venv_root, "Lib", "site-packages", "nvidia")
 for _dll_path in [
     os.path.join(_nvidia_base, "cuda_runtime", "bin", "cudart64_12.dll"),
-    os.path.join(_nvidia_base, "cublas", "bin", "cublasLt64_12.dll"),
-    os.path.join(_nvidia_base, "cublas", "bin", "cublas64_12.dll"),
-    os.path.join(_nvidia_base, "cudnn", "bin", "cudnn64_9.dll"),
+    os.path.join(_nvidia_base, "cublas",       "bin", "cublasLt64_12.dll"),
+    os.path.join(_nvidia_base, "cublas",       "bin", "cublas64_12.dll"),
+    os.path.join(_nvidia_base, "cudnn",        "bin", "cudnn64_9.dll"),
 ]:
     if os.path.exists(_dll_path):
         ctypes.WinDLL(_dll_path)
 
 import webview
-
+import core.stt as stt
 from core.llm import TARSBrain
-from core.stt import start_recording as stt_start, stop_and_transcribe as stt_stop
 from core.tts import synthesize
 
 _window = None
 brain = TARSBrain()
 _tts_executor = ThreadPoolExecutor(max_workers=2)
+_pipeline_lock = threading.Lock()
 
 
 def ensure_ollama():
@@ -64,25 +63,10 @@ def _extract_sentence(buffer: str) -> tuple[str | None, str]:
     return None, buffer
 
 
-class TARSAPI:
-    def start_recording(self) -> None:
-        stt_start()
-
-    def stop_and_process(self) -> None:
-        t0 = time.perf_counter()
-        text = stt_stop()
-        if not text.strip():
-            _window.evaluate_js("resetProcessing()")
-            return
-        print(f"[STT] {text}")
-        _window.evaluate_js(f"onTranscript({json.dumps(text)})")
-        self._run_pipeline(text, t0)
-
-    def send_message(self, text: str) -> dict:
-        self._run_pipeline(text)
-        return {}
-
-    def _run_pipeline(self, text: str, t0: float | None = None) -> None:
+def _run_pipeline(text: str, t0: float | None = None) -> None:
+    with _pipeline_lock:
+        stt.interrupt_event.clear()
+        stt.pipeline_active = True
         sentence_buffer = ""
         first_audio = True
         future_queue: queue.Queue = queue.Queue()
@@ -95,7 +79,7 @@ class TARSAPI:
                 if future is None:
                     break
                 audio_bytes = future.result()
-                if audio_bytes:
+                if audio_bytes and not stt.interrupt_event.is_set():
                     if first_audio and t0 is not None:
                         print(f"[LATENCY] {time.perf_counter() - t0:.2f}s")
                         first_audio = False
@@ -106,22 +90,44 @@ class TARSAPI:
         drain_thread.start()
 
         for chunk in brain.chat_stream(text):
+            if stt.interrupt_event.is_set():
+                break
             sentence_buffer += chunk
             _window.evaluate_js(f"appendTarsText({json.dumps(chunk)})")
-
             while True:
                 sentence, sentence_buffer = _extract_sentence(sentence_buffer)
                 if sentence is None:
                     break
                 future_queue.put(_tts_executor.submit(synthesize, sentence))
 
-        if sentence_buffer.strip():
+        if not stt.interrupt_event.is_set() and sentence_buffer.strip():
             future_queue.put(_tts_executor.submit(synthesize, sentence_buffer.strip()))
 
         future_queue.put(None)
         drain_thread.join()
 
-        _window.evaluate_js("endTarsStream()")
+        stt.pipeline_active = False
+        if stt.interrupt_event.is_set():
+            _window.evaluate_js("interruptStream()")
+        else:
+            _window.evaluate_js("endTarsStream()")
+
+
+def _on_utterance(text: str) -> None:
+    t0 = time.perf_counter()
+    _window.evaluate_js(f"onTranscript({json.dumps(text)})")
+    _run_pipeline(text, t0)
+
+
+def _on_window_loaded():
+    stt.start_listener(_on_utterance)
+    _window.evaluate_js("setStatus('idle')")
+
+
+class TARSAPI:
+    def send_message(self, text: str) -> dict:
+        _run_pipeline(text)
+        return {}
 
     def reset(self) -> None:
         brain.reset()
@@ -140,6 +146,7 @@ if __name__ == "__main__":
         min_size=(700, 480),
         background_color="#060608",
     )
+    _window.events.loaded += _on_window_loaded
     webview.start(
         http_server=True,
         storage_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".webview_data"),

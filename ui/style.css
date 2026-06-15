@@ -73,6 +73,8 @@ body::after {
     overflow: hidden;
 }
 
+.tars-body.dormant     { border-color: #0c0c18; }
+.tars-body.dormant .eye { background: #111126; box-shadow: none; }
 .tars-body.listening   { border-color: var(--green); box-shadow: 0 0 18px var(--green-glow); }
 .tars-body.transcribing{ border-color: var(--amber); box-shadow: 0 0 18px var(--amber-glow); }
 .tars-body.thinking    { border-color: var(--blue);  box-shadow: 0 0 18px var(--blue-glow); }
@@ -295,34 +297,6 @@ body::after {
     display: flex;
     gap: 10px;
     align-items: center;
-}
-
-/* Mic button */
-.mic-btn {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 10px 14px;
-    cursor: pointer;
-    font-family: var(--font);
-    font-size: 9px;
-    letter-spacing: 2px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 5px;
-    min-width: 90px;
-    transition: border-color 0.2s, color 0.2s, box-shadow 0.2s;
-}
-
-.mic-btn svg { width: 18px; height: 18px; }
-
-.mic-btn:hover { border-color: var(--muted); color: var(--text); }
-
-.mic-btn.active {
-    border-color: var(--green);
-    color: var(--green);
-    box-shadow: 0 0 10px var(--green-glow);
 }
 
 /* Text input */
