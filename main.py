@@ -27,12 +27,19 @@ import webview
 import core.stt as stt
 import core.tts as tts
 from core.llm import TARSBrain
+from core.log import Request, fmt_dur
 from core.tts import synthesize
 
 _window = None
 brain = TARSBrain()
 _tts_executor = ThreadPoolExecutor(max_workers=2)
 _pipeline_lock = threading.Lock()
+
+
+def _timed_synthesize(text: str) -> tuple[bytes | None, float, str]:
+    start = time.perf_counter()
+    audio = synthesize(text)
+    return audio, time.perf_counter() - start, text
 
 
 def ensure_ollama():
@@ -74,26 +81,33 @@ def _extract_sentence(buffer: str, allow_comma: bool = False) -> tuple[str | Non
     return None, buffer
 
 
-def _run_pipeline(text: str, t0: float | None = None) -> None:
-    with _pipeline_lock:
+def _run_pipeline(req: Request, text: str) -> None:
+    with req.phase("pipeline-wait-lock"):
+        _pipeline_lock.acquire()
+    try:
         stt.interrupt_event.clear()
         stt.pipeline_active = True
         sentence_buffer = ""
         full_response = ""
-        first_audio_t: float | None = None
+        first_audio_logged = False
         future_queue: queue.Queue = queue.Queue()
         _window.evaluate_js("startTarsStream()")
 
         def drain():
-            nonlocal first_audio_t
+            nonlocal first_audio_logged
             while True:
                 future = future_queue.get()
                 if future is None:
                     break
-                audio_bytes = future.result()
+                audio_bytes, tts_dur, sent = future.result()
+                preview = sent[:60].replace("\n", " ")
+                if len(sent) > 60:
+                    preview += "..."
+                req.event("tts-sentence", f"{fmt_dur(tts_dur)} '{preview}'")
                 if audio_bytes and not stt.interrupt_event.is_set():
-                    if first_audio_t is None and t0 is not None:
-                        first_audio_t = time.perf_counter() - t0
+                    if not first_audio_logged:
+                        req.event("first-audio-ready", fmt_dur(req.t()))
+                        first_audio_logged = True
                     b64 = base64.b64encode(audio_bytes).decode()
                     _window.evaluate_js(f"queueAudio({json.dumps(b64)})")
 
@@ -102,25 +116,33 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
 
         first_chunk_pending = True
         try:
-            for chunk in brain.chat_stream(text):
-                if stt.interrupt_event.is_set():
-                    break
-                sentence_buffer += chunk
-                full_response += chunk
-                while True:
-                    sentence, sentence_buffer = _extract_sentence(
-                        sentence_buffer, allow_comma=first_chunk_pending,
-                    )
-                    if sentence is None:
+            with req.phase("llm-stream") as llm_phase:
+                ttft_start = time.perf_counter()
+                ttft_logged = False
+                for chunk in brain.chat_stream(text):
+                    if not ttft_logged:
+                        req.event("llm-ttft", fmt_dur(time.perf_counter() - ttft_start))
+                        ttft_logged = True
+                    if stt.interrupt_event.is_set():
+                        req.event("interrupt-detected", "stopping LLM stream")
                         break
-                    future_queue.put(_tts_executor.submit(synthesize, sentence))
-                    first_chunk_pending = False
+                    sentence_buffer += chunk
+                    full_response += chunk
+                    while True:
+                        sentence, sentence_buffer = _extract_sentence(
+                            sentence_buffer, allow_comma=first_chunk_pending,
+                        )
+                        if sentence is None:
+                            break
+                        future_queue.put(_tts_executor.submit(_timed_synthesize, sentence))
+                        first_chunk_pending = False
+                llm_phase.note(f"{len(full_response)} chars")
 
             if not stt.interrupt_event.is_set() and sentence_buffer.strip():
-                future_queue.put(_tts_executor.submit(synthesize, sentence_buffer.strip()))
+                future_queue.put(_tts_executor.submit(_timed_synthesize, sentence_buffer.strip()))
         except Exception as e:
             msg = str(e)
-            print(f"[PIPELINE-ERROR] {type(e).__name__}: {msg[:300]}")
+            req.event("pipeline-error", f"{type(e).__name__}: {msg[:200]}")
             if 'CUDA error' in msg or 'cuda' in msg.lower():
                 print("[HINT] Ollama GPU runner failed. Check: 1) `nvidia-smi` driver version "
                       "(need 545+), 2) `ollama --version` (update if old), 3) free VRAM with "
@@ -131,26 +153,25 @@ def _run_pipeline(text: str, t0: float | None = None) -> None:
             # wait with a timeout so a stuck TTS can't hold the lock forever.
             stt.pipeline_active = False
             future_queue.put(None)
-            drain_thread.join(timeout=10.0)
-            if drain_thread.is_alive():
-                print("[PIPELINE] drain thread still alive after 10s — abandoning, may leak audio")
+            with req.phase("drain-wait") as p:
+                drain_thread.join(timeout=10.0)
+                p.note("leaked" if drain_thread.is_alive() else "clean")
             if stt.interrupt_event.is_set():
                 _window.evaluate_js("interruptStream()")
             else:
                 _window.evaluate_js("endTarsStream()")
 
+        req.event("pipeline-total", fmt_dur(req.t()))
         response = full_response.strip()
         if response:
-            if first_audio_t is not None:
-                print(f"[TARS] ({first_audio_t:.2f}s) {response}")
-            else:
-                print(f"[TARS] {response}")
+            print(f"[TARS req={req.id}] {response}")
+    finally:
+        _pipeline_lock.release()
 
 
-def _on_utterance(text: str) -> None:
-    t0 = time.perf_counter()
-    print(f"[YOU] {text}")
-    _run_pipeline(text, t0)
+def _on_utterance(text: str, req: Request) -> None:
+    print(f"[YOU req={req.id}] {text}")
+    _run_pipeline(req, text)
 
 
 def _on_window_loaded():
@@ -160,7 +181,9 @@ def _on_window_loaded():
 
 class TARSAPI:
     def send_message(self, text: str) -> dict:
-        _run_pipeline(text)
+        req = Request()
+        req.event("text-input", f"'{text[:60]}'")
+        _run_pipeline(req, text)
         return {}
 
     def reset(self) -> None:

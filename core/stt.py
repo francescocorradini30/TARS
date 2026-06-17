@@ -6,6 +6,7 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from config import WHISPER_MODEL, WHISPER_DEVICE
+from core.log import Request
 
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
@@ -116,59 +117,65 @@ def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
     return text, score
 
 
-def _process_utterance(audio: np.ndarray, callback) -> None:
+def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
     global _transcribing
     try:
-        # Run both transcriptions in parallel — faster_whisper releases the GIL
-        # during ctranslate2 inference, so this overlaps the en/it passes.
-        en_future = _transcribe_pool.submit(_transcribe, audio, 'en')
-        it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
-        en_text, en_score = en_future.result()
-        it_text, it_score = it_future.result()
+        with req.phase("stt-transcribe") as p:
+            # Run both transcriptions in parallel — faster_whisper releases the GIL
+            # during ctranslate2 inference, so this overlaps the en/it passes.
+            en_future = _transcribe_pool.submit(_transcribe, audio, 'en')
+            it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
+            en_text, en_score = en_future.result()
+            it_text, it_score = it_future.result()
+            p.note(f"en={en_score:.2f} '{en_text}' | it={it_score:.2f} '{it_text}'")
 
-        # Both empty → Whisper's internal VAD rejected the audio as non-speech.
-        # Silently drop, no log spam.
         if not en_text and not it_text:
+            req.event("drop", "whisper VAD rejected (both transcripts empty)")
             return
 
-        # Known Whisper hallucinations in either language → silent drop.
         if _is_noise(en_text) and _is_noise(it_text):
+            req.event("drop", "noise hallucination in both languages")
             return
         if _is_noise(it_text) and it_score >= en_score:
+            req.event("drop", "noise hallucination (it wins)")
             return
 
         # Hard tiebreaker: "TARS" in the English transcript = clearly addressed
         # to the assistant. Accept regardless of which language scored higher.
         if en_text and WAKE_RE.search(en_text) and not _is_noise(en_text):
-            callback(en_text)
+            req.event("accept", "wake word match")
+            callback(en_text, req)
             return
 
         # Italian fits the audio better → user spoke Italian → ignore.
-        # Log both transcripts so we can audit why Whisper picked Italian.
         if it_score > en_score:
-            print(f"[STT-IGNORED] (en {en_score:.2f}: '{en_text}' | it {it_score:.2f}: '{it_text}')")
+            req.event("drop", f"it wins (en={en_score:.2f} it={it_score:.2f})")
             return
 
         if not en_text or _is_noise(en_text):
+            req.event("drop", "en empty or noise")
             return
-        callback(en_text)
+        req.event("accept")
+        callback(en_text, req)
     finally:
         _transcribing = False
 
 
-def _delayed_submit(audio: np.ndarray, callback) -> None:
+def _delayed_submit(req: Request, audio: np.ndarray, callback) -> None:
     """Wait for the interrupted pipeline to finish, then transcribe and process.
     Old 3s timeout was too short — long LLM/TTS responses meant interruption
     utterances were silently dropped."""
     global _transcribing
-    deadline = time.time() + PIPELINE_WAIT_TIMEOUT
-    while pipeline_active and time.time() < deadline:
-        time.sleep(0.02)
+    with req.phase("interrupt-wait-prev") as p:
+        deadline = time.time() + PIPELINE_WAIT_TIMEOUT
+        while pipeline_active and time.time() < deadline:
+            time.sleep(0.02)
+        p.note("timed out" if pipeline_active else "prev pipeline finished")
     if pipeline_active:
-        print(f"[STT] interruption dropped — pipeline still running after {PIPELINE_WAIT_TIMEOUT}s")
+        req.event("drop", f"interruption — prev pipeline still running after {PIPELINE_WAIT_TIMEOUT}s")
         return
     _transcribing = True
-    _process_utterance(audio, callback)
+    _process_utterance(req, audio, callback)
 
 
 def _listener_loop_inner(callback) -> None:
@@ -179,6 +186,7 @@ def _listener_loop_inner(callback) -> None:
     in_speech            = False
     silence_count        = 0
     interrupted_this     = False
+    req: Request | None  = None
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
                         blocksize=CHUNK_SAMPLES) as stream:
@@ -195,11 +203,14 @@ def _listener_loop_inner(callback) -> None:
                     in_speech = True
                     utterance = list(pre_buffer) + [chunk]
                     silence_count = 0
+                    req = Request()
+                    req.event("vad-speech-start")
                     # Only interrupt when LLM/TTS pipeline is actually running,
                     # not during Whisper transcription of a previous utterance.
                     if pipeline_active:
                         interrupt_event.set()
                         interrupted_this = True
+                        req.event("interrupt-set", "pipeline_active=True")
                     else:
                         interrupted_this = False
             else:
@@ -209,25 +220,32 @@ def _listener_loop_inner(callback) -> None:
                     if silence_count >= SILENCE_CHUNKS:
                         in_speech = False
                         audio = np.concatenate(utterance)
+                        audio_sec = len(audio) / SAMPLE_RATE
                         utterance = []
                         pre_buffer = []
                         silence_count = 0
+                        assert req is not None
+                        req.event("vad-utterance-end", f"audio {audio_sec:.2f}s")
                         if len(audio) >= MIN_AUDIO_SAMPLES:
                             if interrupted_this:
                                 threading.Thread(
                                     target=_delayed_submit,
-                                    args=(audio, callback),
+                                    args=(req, audio, callback),
                                     daemon=True,
                                 ).start()
                             elif not _transcribing:
                                 _transcribing = True
                                 threading.Thread(
                                     target=_process_utterance,
-                                    args=(audio, callback),
+                                    args=(req, audio, callback),
                                     daemon=True,
                                 ).start()
-                            # else: transcription already running — discard this utterance
+                            else:
+                                req.event("drop", "stt busy — prev transcription still running")
+                        else:
+                            req.event("drop", f"audio too short ({audio_sec:.2f}s)")
                         interrupted_this = False
+                        req = None
                 else:
                     silence_count = 0
 
