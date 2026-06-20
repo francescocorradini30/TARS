@@ -20,7 +20,10 @@ class TARSBrain:
     """
 
     def __init__(self):
-        self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Persistent memory (profile + past sessions) gets folded into the system
+        # message via set_memory_context(); empty until then. reset() keeps it.
+        self._memory_context = ""
+        self.history: list[dict] = [{"role": "system", "content": self._compose_system()}]
         self.backend = LLM_BACKEND
         if self.backend == "groq":
             if not GROQ_API_KEY:
@@ -72,8 +75,22 @@ class TARSBrain:
                 # request doesn't see two user messages in a row.
                 self.history.pop()
 
+    def _compose_system(self) -> str:
+        """The base TARS persona, plus the remembered context when present."""
+        if self._memory_context:
+            return SYSTEM_PROMPT + "\n\n" + self._memory_context
+        return SYSTEM_PROMPT
+
+    def set_memory_context(self, memory_context: str) -> None:
+        """Inject (or refresh) the persistent-memory block. Rebuilds the system
+        message in place, leaving the rest of the conversation untouched."""
+        self._memory_context = (memory_context or "").strip()
+        self.history[0] = {"role": "system", "content": self._compose_system()}
+
     def reset(self):
-        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Clears the conversation but keeps the remembered context — wiping the
+        # chat shouldn't make TARS forget who he's talking to.
+        self.history = [{"role": "system", "content": self._compose_system()}]
 
     def warmup(self):
         """Force Ollama to load the model into GPU memory now, before Whisper

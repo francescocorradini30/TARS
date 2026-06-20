@@ -49,10 +49,12 @@ import core.tts as tts
 from config import LLM_BACKEND
 from core.llm import TARSBrain
 from core.log import Request, fmt_dur
+from core.memory import MemoryStore
 from core.tts import synthesize
 
 _window = None
 brain = TARSBrain()
+memory = MemoryStore()
 _tts_executor = ThreadPoolExecutor(max_workers=2)
 _pipeline_lock = threading.Lock()
 
@@ -141,6 +143,9 @@ def _run_pipeline(req: Request, text: str) -> None:
         with _cancel_lock:
             _current_cancel = cancel
         stt.pipeline_active = True
+        # Journal the user turn the moment we start answering it. If the app dies
+        # mid-response this line is already on disk, so the session is recoverable.
+        memory.log_turn("user", text)
         sentence_buffer = ""
         full_response = ""
         first_audio_logged = False
@@ -233,6 +238,9 @@ def _run_pipeline(req: Request, text: str) -> None:
         response = full_response.strip()
         if response:
             print(f"[TARS req={req.id}] {response}")
+            # Journal whatever TARS actually said — even a barged-in partial is a
+            # real thing that happened, and consolidation should see it.
+            memory.log_turn("assistant", response)
     finally:
         _pipeline_lock.release()
 
@@ -277,6 +285,29 @@ if __name__ == "__main__":
     # Kokoro warmup in background — the model may need downloading (~350MB)
     # on first run; we don't want to block window startup behind that.
     threading.Thread(target=tts.warmup, daemon=True).start()
+
+    # Persistent memory. First mop up any session a previous crash left
+    # un-distilled (the raw turns are safe in the journal), then open this
+    # session — stamping its start time — and fold what we remember about the
+    # user into TARS's system prompt so he walks in already knowing them.
+    try:
+        recovered = memory.consolidate_pending()
+        if recovered:
+            print(f"[MEMORY] recovered {recovered} un-consolidated session(s) from a previous run")
+    except Exception as e:
+        print(f"[MEMORY] startup consolidation skipped: {type(e).__name__}: {e}")
+    sess = memory.start_session()
+    print(f"[MEMORY] session {sess['id']} started at {sess['started_at']}")
+    try:
+        _ctx = memory.build_context_block()
+        brain.set_memory_context(_ctx)
+        # Log the exact memory TARS walks in with — the most direct proof that he
+        # received what he learned in past sessions. (Test aid; cheap to keep.)
+        print("[MEMORY] ----- injected context for this session -----")
+        print(_ctx)
+        print("[MEMORY] ----- end injected context -----")
+    except Exception as e:
+        print(f"[MEMORY] context build failed: {type(e).__name__}: {e}")
     ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
     _window = webview.create_window(
         title="TARS",
@@ -293,3 +324,23 @@ if __name__ == "__main__":
         http_server=True,
         storage_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".webview_data"),
     )
+
+    # webview.start() blocks until the window is closed. Stop the mic listener
+    # FIRST: otherwise it keeps capturing audio and, once the interpreter starts
+    # tearing down the Whisper thread pool at exit, a late utterance hits a
+    # shut-down pool ("cannot schedule new futures after shutdown"). Quieting the
+    # listener here closes that window.
+    stt.stop_listener()
+
+    # Now finalize the session: stamp its end time, then distill it into long-term
+    # memory (Groq by default). Doing it here — after the UI is gone — means the
+    # LLM pass can take its time without freezing the close; a hard kill before
+    # this is covered by the crash-recovery sweep at the next startup.
+    memory.end_session()
+    print(f"[MEMORY] session {memory.session_id} ended; consolidating...")
+    try:
+        memory.consolidate_pending()
+        print("[MEMORY] consolidation done")
+    except Exception as e:
+        print(f"[MEMORY] shutdown consolidation failed: {type(e).__name__}: {e}")
+    memory.close()

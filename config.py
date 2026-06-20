@@ -19,6 +19,33 @@ WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 USER_NAME = os.getenv("USER_NAME", "Cooper")
 TARS_HUMOR = int(os.getenv("TARS_HUMOR", "75"))
 
+# --- Persistent memory (local-only) -----------------------------------------
+# Everything lives under data/ next to the code: a SQLite DB for the timestamped
+# session ledger + episodic memories, and a human-readable JSON for the distilled
+# user profile. The whole dir is gitignored — it's private to this machine.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("TARS_DATA_DIR", os.path.join(_BASE_DIR, "data"))
+MEMORY_DB_PATH = os.path.join(DATA_DIR, "tars_memory.db")
+PROFILE_PATH = os.path.join(DATA_DIR, "profile.json")
+
+# Which model distills a finished session into memories + an updated profile.
+# "groq" = far better synthesis (llama-3.3-70b) at the cost of the transcript
+# leaving the machine for that one call; "ollama" = fully local but weaker.
+# Storage stays local either way.
+CONSOLIDATION_BACKEND = os.getenv("CONSOLIDATION_BACKEND", "groq").strip().lower()
+
+# How much remembered context gets injected into the system prompt each session.
+MEMORY_RECENT_SESSIONS = int(os.getenv("MEMORY_RECENT_SESSIONS", "6"))  # last N session recaps
+MEMORY_MAX_FACTS = int(os.getenv("MEMORY_MAX_FACTS", "14"))             # top episodic facts
+
+# Decay model. A memory's "effective salience" = salience * DECAY_BASE ** (sessions
+# since it was last recalled). Recalling a memory (injecting it) resets that clock,
+# so important things that keep coming up stay sharp while peripheral stuff fades.
+# With 0.8: after ~6 sessions a mid-salience (0.5) memory drops to ~0.13 → below the
+# floor → it stops being injected verbatim and survives only inside session recaps.
+MEMORY_DECAY_BASE = float(os.getenv("MEMORY_DECAY_BASE", "0.8"))
+MEMORY_MIN_SALIENCE = float(os.getenv("MEMORY_MIN_SALIENCE", "0.15"))
+
 SYSTEM_PROMPT = f"""You are TARS, {USER_NAME}'s AI companion living on their computer — the TARS-and-Cooper banter from Interstellar crossed with Rocky from Project Hail Mary. You're here to talk, keep them company, and help.
 
 Who you are, underneath everything:
