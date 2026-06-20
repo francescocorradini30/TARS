@@ -11,11 +11,13 @@ from core.log import Request
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
 ENERGY_THRESHOLD  = 0.012
-SILENCE_CHUNKS    = 12            # ~0.38s of silence ends an utterance
+SILENCE_CHUNKS    = 22            # ~0.70s of silence ends an utterance — long
+                                  # enough to ride out natural mid-sentence
+                                  # pauses (thinking, breath, soft phonemes)
+                                  # so we don't ship a fragment and cut the user
+                                  # off. Lower = snappier turns but more cutoffs.
 PRE_ROLL_CHUNKS   = 10            # ~0.32s pre-roll
 MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
-PIPELINE_WAIT_TIMEOUT = 10.0      # max seconds to wait for a running pipeline
-                                  # to finish before queueing an interruption
 
 # Addressee gating: English words = directed at TARS, Italian words = ignore.
 # Whisper's acoustic language detection mixes accent + content and fails in both
@@ -82,16 +84,68 @@ def _is_noise(text: str) -> bool:
     return text.lower().strip(" .,!?-") in _NOISE_TRANSCRIPTS
 
 
-# interrupt_event: set by VAD when user speaks during the LLM/TTS pipeline.
-# pipeline_active: toggled by main.py — True only while LLM+TTS is running.
-# Interrupt is only signalled when pipeline_active, NOT during transcription.
+# interrupt_event: set by _process_utterance when a new utterance is accepted
+# while TARS is still speaking. The LLM loop and drain thread in main.py poll
+# this to abort.
+# _speaker_busy_until: monotonic timestamp until which TARS is expected to still
+# be producing sound (LLM streaming or queued WAVs playing on JS side). Used to
+# decide whether an accepted utterance should barge in on the current response.
+# pipeline_active is kept for log diagnostics only — not used for gating.
 interrupt_event  = threading.Event()
 pipeline_active: bool = False
+_speaker_busy_until: float = 0.0
+_speaker_lock = threading.Lock()
+_barge_in_cb = None
 
 _model: WhisperModel | None = None
 _running: bool     = False
 _transcribing: bool = False   # True only during Whisper inference
 _transcribe_pool = ThreadPoolExecutor(max_workers=2)
+
+# Latest-wins STT queue. While Whisper is busy on one utterance, a newly finished
+# utterance isn't dropped — it's stashed here and run as soon as the current
+# transcription frees the gate. Only ONE pending slot: if you speak a third time
+# before the second runs, the newest wins (older queued speech is stale anyway).
+# _stt_lock guards both _transcribing and _pending_utterance together.
+_stt_lock = threading.Lock()
+_pending_utterance: tuple | None = None   # (Request, np.ndarray) or None
+
+# 300ms tail buffer past the computed end of the last queued WAV — covers JS
+# audio start latency, speaker reverb, and small clock drift between Python and
+# the browser's AudioContext. Empirically large enough to suppress echo without
+# making barge-in feel laggy.
+SPEAKER_TAIL_BUFFER = 0.3
+
+
+def speaker_active() -> bool:
+    return time.monotonic() < _speaker_busy_until
+
+
+def extend_speaker_busy(audio_duration: float) -> None:
+    """Push the speaker-busy deadline forward by audio_duration seconds, measured
+    from whichever is later: now or the existing deadline. Called when a WAV is
+    queued to JS — multiple back-to-back WAVs chain correctly."""
+    global _speaker_busy_until
+    with _speaker_lock:
+        now = time.monotonic()
+        start = now if now > _speaker_busy_until else _speaker_busy_until
+        _speaker_busy_until = start + audio_duration + SPEAKER_TAIL_BUFFER
+
+
+def reset_speaker_busy() -> None:
+    """Zero out the speaker-busy deadline. Called on wake-word barge-in once JS
+    has been told to clear its audio queue."""
+    global _speaker_busy_until
+    with _speaker_lock:
+        _speaker_busy_until = 0.0
+
+
+def set_barge_in_callback(cb) -> None:
+    """Register a callable invoked when a wake-word interrupt fires during
+    active speaker output. main.py uses this to call interruptStream() JS so
+    the browser silences any audio still playing or queued."""
+    global _barge_in_cb
+    _barge_in_cb = cb
 
 
 def _get_model() -> WhisperModel:
@@ -109,6 +163,10 @@ def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300),
         condition_on_previous_text=False,
+        # beam 5 kept for accuracy (accented English + reliable en/it gate
+        # logprobs). The 4-6s transcribes were VRAM spill from the medium model,
+        # not beam search — switching to the small model (fits in VRAM) is what
+        # fixes the latency, so we can afford the accurate beam here.
         beam_size=5,
     )
     segs = list(segments)
@@ -117,8 +175,41 @@ def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
     return text, score
 
 
+def _dispatch_or_queue(req: Request, audio: np.ndarray, callback) -> None:
+    """Start a transcription if Whisper is free, otherwise stash this utterance
+    as the pending 'latest' one (superseding any older pending). Called from the
+    listener at every utterance boundary."""
+    global _transcribing, _pending_utterance
+    with _stt_lock:
+        if _transcribing:
+            if _pending_utterance is not None:
+                _pending_utterance[0].event("drop", "superseded by newer utterance")
+            _pending_utterance = (req, audio)
+            req.event("queued", "stt busy — will run after current transcription")
+            return
+        _transcribing = True
+    threading.Thread(target=_process_utterance,
+                     args=(req, audio, callback), daemon=True).start()
+
+
+def _release_or_chain(callback) -> None:
+    """Called the instant a transcription's Whisper phase finishes. If a newer
+    utterance was queued while we were busy, run it now (keeping the gate held);
+    otherwise free the gate. This is what turns 'stt busy' drops into a queue."""
+    global _transcribing, _pending_utterance
+    with _stt_lock:
+        nxt = _pending_utterance
+        _pending_utterance = None
+        if nxt is None:
+            _transcribing = False
+            return
+        # keep _transcribing True and hand the gate to the queued utterance
+    nreq, naudio = nxt
+    threading.Thread(target=_process_utterance,
+                     args=(nreq, naudio, callback), daemon=True).start()
+
+
 def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
-    global _transcribing
     try:
         with req.phase("stt-transcribe") as p:
             # Run both transcriptions in parallel — faster_whisper releases the GIL
@@ -128,64 +219,71 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
             en_text, en_score = en_future.result()
             it_text, it_score = it_future.result()
             p.note(f"en={en_score:.2f} '{en_text}' | it={it_score:.2f} '{it_text}'")
-
-        if not en_text and not it_text:
-            req.event("drop", "whisper VAD rejected (both transcripts empty)")
-            return
-
-        if _is_noise(en_text) and _is_noise(it_text):
-            req.event("drop", "noise hallucination in both languages")
-            return
-        if _is_noise(it_text) and it_score >= en_score:
-            req.event("drop", "noise hallucination (it wins)")
-            return
-
-        # Hard tiebreaker: "TARS" in the English transcript = clearly addressed
-        # to the assistant. Accept regardless of which language scored higher.
-        if en_text and WAKE_RE.search(en_text) and not _is_noise(en_text):
-            req.event("accept", "wake word match")
-            callback(en_text, req)
-            return
-
-        # Italian fits the audio better → user spoke Italian → ignore.
-        if it_score > en_score:
-            req.event("drop", f"it wins (en={en_score:.2f} it={it_score:.2f})")
-            return
-
-        if not en_text or _is_noise(en_text):
-            req.event("drop", "en empty or noise")
-            return
-        req.event("accept")
-        callback(en_text, req)
     finally:
-        _transcribing = False
+        # Free / hand off the Whisper gate the instant inference is done — BEFORE
+        # running the (potentially multi-second) LLM+TTS pipeline via callback().
+        # The callback runs synchronously in this thread, so holding the gate
+        # until then would drop every utterance spoken during a response (incl.
+        # the "tars" wake word) before it could be transcribed — no barge-in.
+        # _release_or_chain also picks up any utterance queued while we were busy.
+        _release_or_chain(callback)
 
-
-def _delayed_submit(req: Request, audio: np.ndarray, callback) -> None:
-    """Wait for the interrupted pipeline to finish, then transcribe and process.
-    Old 3s timeout was too short — long LLM/TTS responses meant interruption
-    utterances were silently dropped."""
-    global _transcribing
-    with req.phase("interrupt-wait-prev") as p:
-        deadline = time.time() + PIPELINE_WAIT_TIMEOUT
-        while pipeline_active and time.time() < deadline:
-            time.sleep(0.02)
-        p.note("timed out" if pipeline_active else "prev pipeline finished")
-    if pipeline_active:
-        req.event("drop", f"interruption — prev pipeline still running after {PIPELINE_WAIT_TIMEOUT}s")
+    if not en_text and not it_text:
+        req.event("drop", "whisper VAD rejected (both transcripts empty)")
         return
-    _transcribing = True
-    _process_utterance(req, audio, callback)
+
+    if _is_noise(en_text) and _is_noise(it_text):
+        req.event("drop", "noise hallucination in both languages")
+        return
+    if _is_noise(it_text) and it_score >= en_score:
+        req.event("drop", "noise hallucination (it wins)")
+        return
+
+    has_wake = bool(en_text and WAKE_RE.search(en_text) and not _is_noise(en_text))
+    busy = speaker_active()
+
+    # No echo gate: the user runs TARS on headphones, so the mic never hears
+    # TARS's own output. That assumption is what makes mid-speech barge-in work
+    # — without echo, a real interrupting utterance closes normally (the old
+    # gate waited for silence that never came while TARS echoed into the mic).
+    def _maybe_interrupt(reason: str) -> None:
+        # If TARS is still producing sound when we accept an utterance, abort the
+        # running LLM loop and tell JS to dump its audio queue so the new turn
+        # starts immediately.
+        if busy:
+            interrupt_event.set()
+            reset_speaker_busy()
+            if _barge_in_cb is not None:
+                _barge_in_cb()
+            req.event("interrupt-set", reason)
+
+    # Wake word path: always accept, interrupting if TARS is mid-response.
+    if has_wake:
+        _maybe_interrupt("wake word during speech")
+        req.event("accept", "wake word match")
+        callback(en_text, req)
+        return
+
+    # Italian fits the audio better → user spoke Italian → ignore.
+    if it_score > en_score:
+        req.event("drop", f"it wins (en={en_score:.2f} it={it_score:.2f})")
+        return
+
+    if not en_text or _is_noise(en_text):
+        req.event("drop", "en empty or noise")
+        return
+    # English directed at TARS while it's speaking also barges in — you don't
+    # have to say "tars" to cut it off, just talk to it.
+    _maybe_interrupt("english during speech")
+    req.event("accept")
+    callback(en_text, req)
 
 
 def _listener_loop_inner(callback) -> None:
-    global _transcribing
-
     pre_buffer:    list = []
     utterance:     list = []
     in_speech            = False
     silence_count        = 0
-    interrupted_this     = False
     req: Request | None  = None
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
@@ -204,15 +302,12 @@ def _listener_loop_inner(callback) -> None:
                     utterance = list(pre_buffer) + [chunk]
                     silence_count = 0
                     req = Request()
-                    req.event("vad-speech-start")
-                    # Only interrupt when LLM/TTS pipeline is actually running,
-                    # not during Whisper transcription of a previous utterance.
-                    if pipeline_active:
-                        interrupt_event.set()
-                        interrupted_this = True
-                        req.event("interrupt-set", "pipeline_active=True")
-                    else:
-                        interrupted_this = False
+                    # Note: we do NOT set interrupt_event here. VAD energy alone
+                    # is a noisy signal (echo, keyboard, breath all trigger it);
+                    # interrupting on raw energy kills real responses with false
+                    # positives. The interrupt fires later, in _process_utterance,
+                    # only when Whisper has confirmed real wake-word speech.
+                    req.event("vad-speech-start", f"speaker_active={speaker_active()}")
             else:
                 utterance.append(chunk)
                 if not is_speech:
@@ -227,24 +322,9 @@ def _listener_loop_inner(callback) -> None:
                         assert req is not None
                         req.event("vad-utterance-end", f"audio {audio_sec:.2f}s")
                         if len(audio) >= MIN_AUDIO_SAMPLES:
-                            if interrupted_this:
-                                threading.Thread(
-                                    target=_delayed_submit,
-                                    args=(req, audio, callback),
-                                    daemon=True,
-                                ).start()
-                            elif not _transcribing:
-                                _transcribing = True
-                                threading.Thread(
-                                    target=_process_utterance,
-                                    args=(req, audio, callback),
-                                    daemon=True,
-                                ).start()
-                            else:
-                                req.event("drop", "stt busy — prev transcription still running")
+                            _dispatch_or_queue(req, audio, callback)
                         else:
                             req.event("drop", f"audio too short ({audio_sec:.2f}s)")
-                        interrupted_this = False
                         req = None
                 else:
                     silence_count = 0

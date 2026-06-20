@@ -1,5 +1,6 @@
 import base64
 import ctypes
+import io
 import json
 import os
 import queue
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.request
+import wave
 from concurrent.futures import ThreadPoolExecutor
 
 # Pre-load CUDA 12 DLLs installed via pip so ctranslate2 finds them via LoadLibrary
@@ -26,6 +28,7 @@ for _dll_path in [
 import webview
 import core.stt as stt
 import core.tts as tts
+from config import LLM_BACKEND
 from core.llm import TARSBrain
 from core.log import Request, fmt_dur
 from core.tts import synthesize
@@ -40,6 +43,24 @@ def _timed_synthesize(text: str) -> tuple[bytes | None, float, str]:
     start = time.perf_counter()
     audio = synthesize(text)
     return audio, time.perf_counter() - start, text
+
+
+def _wav_duration(audio_bytes: bytes) -> float:
+    """Read frames + sample rate from the WAV header to know how long this clip
+    will play. Feeds the speaker-busy timer so barge-in stays armed for the
+    full playback window, not just while Python is queueing."""
+    try:
+        with wave.open(io.BytesIO(audio_bytes), 'rb') as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return 0.0
+
+
+def _barge_in() -> None:
+    """Tell the browser to drop any queued or playing audio. Invoked from stt
+    when wake-word interrupt fires while TARS is still producing sound."""
+    if _window is not None:
+        _window.evaluate_js("interruptStream()")
 
 
 def ensure_ollama():
@@ -108,6 +129,8 @@ def _run_pipeline(req: Request, text: str) -> None:
                     if not first_audio_logged:
                         req.event("first-audio-ready", fmt_dur(req.t()))
                         first_audio_logged = True
+                    wav_dur = _wav_duration(audio_bytes)
+                    stt.extend_speaker_busy(wav_dur)
                     b64 = base64.b64encode(audio_bytes).decode()
                     _window.evaluate_js(f"queueAudio({json.dumps(b64)})")
 
@@ -175,6 +198,7 @@ def _on_utterance(text: str, req: Request) -> None:
 
 
 def _on_window_loaded():
+    stt.set_barge_in_callback(_barge_in)
     stt.start_listener(_on_utterance)
     _window.evaluate_js("setStatus('idle')")
 
@@ -191,15 +215,20 @@ class TARSAPI:
 
 
 if __name__ == "__main__":
-    ensure_ollama()
-    # Load llama runner into GPU BEFORE Whisper takes the CUDA context.
-    # Reverse order triggers "shared object initialization failed" on the
-    # llama runner because Whisper holds the GPU first.
-    print("[OLLAMA] warming up llama runner on GPU...")
-    try:
-        brain.warmup()
-    except Exception as e:
-        print(f"[OLLAMA-WARMUP] {type(e).__name__}: {e}")
+    # Cloud backend (groq) needs neither a local Ollama server nor a GPU warmup —
+    # the LLM lives off-machine, which is exactly what frees the VRAM.
+    if LLM_BACKEND == "ollama":
+        ensure_ollama()
+        # Load llama runner into GPU BEFORE Whisper takes the CUDA context.
+        # Reverse order triggers "shared object initialization failed" on the
+        # llama runner because Whisper holds the GPU first.
+        print("[OLLAMA] warming up llama runner on GPU...")
+        try:
+            brain.warmup()
+        except Exception as e:
+            print(f"[OLLAMA-WARMUP] {type(e).__name__}: {e}")
+    else:
+        print(f"[LLM] backend={LLM_BACKEND} (cloud) — skipping Ollama + GPU warmup")
     # Kokoro warmup in background — the model may need downloading (~350MB)
     # on first run; we don't want to block window startup behind that.
     threading.Thread(target=tts.warmup, daemon=True).start()

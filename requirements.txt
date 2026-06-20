@@ -3,6 +3,7 @@ faster-whisper
 sounddevice
 numpy
 ollama
+groq
 python-dotenv
 kokoro-onnx
 soundfile

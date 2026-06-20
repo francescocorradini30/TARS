@@ -20,5 +20,8 @@ __pycache__/
 # kokoro models (downloaded at runtime)
 models/
 
+# voice audition samples (local only)
+voice_samples/
+
 # project docs (local only)
 CLAUDE.md
