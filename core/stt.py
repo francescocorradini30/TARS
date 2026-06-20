@@ -50,11 +50,24 @@ BARGE_WHISPER_MODEL  = "base.en"
 # mishearings), the user is clearly addressing the assistant — accept regardless
 # of how close the en/it logprobs are. Catches short greetings like "Hey TARS"
 # that fall in the margin gap.
+# Hotwords bias the decoder toward these tokens so Whisper stops rendering the
+# wake word and common address forms as similar-sounding everyday words
+# ("hey TARS" -> "Cheers"). Passed ONLY to the English pass: biasing the Italian
+# pass would distort the en/it addressee logprob comparison the gate relies on.
+HOTWORDS = "TARS, hey TARS, TARS are you there"
+
+# Same bias for the mid-speech barge check. The check runs on the small base.en
+# model, which without this hint mis-transcribes the wake word and silently fails
+# to interrupt — so TARS only stops at end-of-utterance (the big model's pass)
+# instead of the instant you say "TARS". MUST stay in sync with the wake word.
+BARGE_HOTWORDS = "TARS"
+
 WAKE_RE = re.compile(
     r'\b(?:'
     r'tars?|tarz|tarce|tarso|tarsi|tarsh|thars?|tarus|tarcy|'  # T-initial variants
     r'dars?|darz|darce|darso|darsi|darsh|dhars?|darus|darcy|'  # D-initial (Whisper softens T→D often)
-    r'taz|daz|terz|terce|derz|derce'                            # rarer mishearings
+    r'taz|daz|terz|terce|derz|derce|'                           # rarer mishearings
+    r'cheers?|chars?|chers?|tchars?'                            # "hey TARS" → "cheers/chars/chers"
     r')\b',
     re.I,
 )
@@ -117,6 +130,12 @@ _barge_check_started: float = 0.0  # monotonic start of the in-flight check
 
 _model: WhisperModel | None = None
 _barge_model: WhisperModel | None = None  # separate instance for barge checks
+# Serializes model construction. Without it the warmup thread + the en and it
+# transcribe futures of the very first utterance all race into WhisperModel(),
+# each allocating the full model on the GPU at once (3x ~1.6GB for turbo) -> CUDA
+# OOM. The lock makes construction happen exactly once; later callers reuse it.
+# Shared by both models so turbo and base.en never allocate on CUDA simultaneously.
+_model_load_lock = threading.Lock()
 _running: bool     = False
 _transcribing: bool = False   # True only during Whisper inference
 _transcribe_pool = ThreadPoolExecutor(max_workers=2)
@@ -185,20 +204,25 @@ def _strip_wake(text: str) -> str:
 def _get_model() -> WhisperModel:
     global _model
     if _model is None:
-        compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
-        _model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute)
+        with _model_load_lock:
+            if _model is None:  # re-check: another thread may have loaded it while we waited
+                compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+                _model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute)
     return _model
 
 
 def _get_barge_model() -> WhisperModel:
     global _barge_model
     if _barge_model is None:
-        compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
-        _barge_model = WhisperModel(BARGE_WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute)
+        with _model_load_lock:
+            if _barge_model is None:
+                compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+                _barge_model = WhisperModel(BARGE_WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute)
     return _barge_model
 
 
-def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
+def _transcribe(audio: np.ndarray, language: str,
+                hotwords: str | None = None) -> tuple[str, float]:
     segments, _ = _get_model().transcribe(
         audio,
         language=language,
@@ -210,6 +234,7 @@ def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
         # not beam search — switching to the small model (fits in VRAM) is what
         # fixes the latency, so we can afford the accurate beam here.
         beam_size=5,
+        hotwords=hotwords,
     )
     segs = list(segments)
     text = " ".join(s.text for s in segs).strip()
@@ -229,6 +254,7 @@ def _transcribe_fast(audio: np.ndarray) -> str:
         vad_parameters=dict(min_silence_duration_ms=200),
         condition_on_previous_text=False,
         beam_size=1,
+        hotwords=BARGE_HOTWORDS,
     )
     return " ".join(s.text for s in segments).strip()
 
@@ -296,7 +322,7 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
         with req.phase("stt-transcribe") as p:
             # Run both transcriptions in parallel — faster_whisper releases the GIL
             # during ctranslate2 inference, so this overlaps the en/it passes.
-            en_future = _transcribe_pool.submit(_transcribe, audio, 'en')
+            en_future = _transcribe_pool.submit(_transcribe, audio, 'en', HOTWORDS)
             it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
             en_text, en_score = en_future.result()
             it_text, it_score = it_future.result()
@@ -352,6 +378,15 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
         return
 
     # Idle: normal addressee gate — English = talking to TARS, Italian = ignore.
+    # But if the English transcript carries the wake word, the user is clearly
+    # addressing TARS — accept regardless of how the en/it logprobs landed. This is
+    # the documented WAKE_RE tiebreaker, which was previously only wired into the
+    # busy/barge-in path: a short "hey TARS" that scored marginally better as
+    # Italian got wrongly dropped here.
+    if has_wake:
+        req.event("accept", "wake word (idle tiebreaker)")
+        callback(en_text, req)
+        return
     if it_score > en_score:
         req.event("drop", f"it wins (en={en_score:.2f} it={it_score:.2f})")
         return

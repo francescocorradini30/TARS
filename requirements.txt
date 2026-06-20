@@ -7,3 +7,12 @@ groq
 python-dotenv
 kokoro-onnx
 soundfile
+
+# TTS (Kokoro) runs on GPU via onnxruntime-gpu. GOTCHA: kokoro-onnx AND
+# faster-whisper both depend on plain `onnxruntime` (CPU), which shares the same
+# import name and CONFLICTS with onnxruntime-gpu. After a fresh install run:
+#     pip uninstall -y onnxruntime
+# cuFFT is required by onnxruntime-gpu's CUDA EP (cufft64_11.dll) and is NOT among
+# the CUDA libs ctranslate2/faster-whisper pulls in (cublas/cudnn/cudart/nvrtc).
+onnxruntime-gpu
+nvidia-cufft-cu12

@@ -13,13 +13,31 @@ import urllib.request
 import wave
 from concurrent.futures import ThreadPoolExecutor
 
-# Pre-load CUDA 12 DLLs installed via pip so ctranslate2 finds them via LoadLibrary
+# Make the pip-installed CUDA 12 libraries discoverable so BOTH ctranslate2
+# (faster-whisper) and onnxruntime-gpu (Kokoro TTS) find their dependencies.
+# Three mechanisms are needed together — each provider resolves DLLs differently:
+#   1) add every nvidia/*/bin to PATH    — cuDNN's loader (cudnn64_9.dll) finds its
+#      split sub-DLLs (cudnn_ops/graph/...) only via PATH, not add_dll_directory.
+#   2) os.add_dll_directory on each       — onnxruntime_providers_cuda.dll resolves
+#      cublasLt/cufft/nvjitlink transitive deps.
+#   3) WinDLL pre-load the top-level libs — forces them resident before ctranslate2
+#      LoadLibrary's them (the original Whisper fix; order: runtime before the rest).
+import glob as _glob
 _venv_root = os.path.dirname(os.path.dirname(sys.executable))
 _nvidia_base = os.path.join(_venv_root, "Lib", "site-packages", "nvidia")
+_nv_bins = _glob.glob(os.path.join(_nvidia_base, "*", "bin"))
+os.environ["PATH"] = os.pathsep.join(_nv_bins) + os.pathsep + os.environ.get("PATH", "")
+for _d in _nv_bins:
+    try:
+        os.add_dll_directory(_d)
+    except OSError:
+        pass
 for _dll_path in [
     os.path.join(_nvidia_base, "cuda_runtime", "bin", "cudart64_12.dll"),
+    os.path.join(_nvidia_base, "nvjitlink",    "bin", "nvJitLink_120_0.dll"),
     os.path.join(_nvidia_base, "cublas",       "bin", "cublasLt64_12.dll"),
     os.path.join(_nvidia_base, "cublas",       "bin", "cublas64_12.dll"),
+    os.path.join(_nvidia_base, "cufft",        "bin", "cufft64_11.dll"),
     os.path.join(_nvidia_base, "cudnn",        "bin", "cudnn64_9.dll"),
 ]:
     if os.path.exists(_dll_path):

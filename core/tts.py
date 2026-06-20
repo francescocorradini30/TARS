@@ -41,12 +41,41 @@ def _ensure_model() -> tuple[str, str]:
         return str(model_path), str(voices_path)
 
 
+def _build_session(model_path: str):
+    """Build the ONNX session on GPU if CUDA is available, else plain CPU. Any
+    CUDA init failure (missing DLL, no VRAM) degrades gracefully to CPU, never
+    crashes the app.
+
+    No hard gpu_mem_limit: a tight cap (we tried 1GB) makes long sentences with 2
+    concurrent synths OOM *inside* the arena and drop audio. Instead we keep the
+    footprint natural with arena_extend_strategy=kSameAsRequested — onnxruntime
+    only grabs what each request needs (measured peak ~1.26GB for Kokoro), which
+    is itself the Chrome protection: total turbo+base.en+Kokoro ~3GB on the 6GB
+    card, ~3GB left. cudnn HEURISTIC keeps conv algos low-memory."""
+    import onnxruntime as rt
+    if "CUDAExecutionProvider" in rt.get_available_providers():
+        cuda_opts = {
+            "arena_extend_strategy": "kSameAsRequested",
+            "cudnn_conv_algo_search": "HEURISTIC",
+        }
+        providers = [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+        try:
+            sess = rt.InferenceSession(model_path, providers=providers)
+            print(f"[TTS] Kokoro on GPU (CUDA) — {sess.get_providers()}")
+            return sess
+        except Exception as e:
+            print(f"[TTS] CUDA session failed ({type(e).__name__}: {e}) — CPU fallback")
+    sess = rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    print("[TTS] Kokoro on CPU")
+    return sess
+
+
 def _get_kokoro():
     global _kokoro
     if _kokoro is None:
         from kokoro_onnx import Kokoro
         model_path, voices_path = _ensure_model()
-        _kokoro = Kokoro(model_path, voices_path)
+        _kokoro = Kokoro.from_session(_build_session(model_path), voices_path)
     return _kokoro
 
 
