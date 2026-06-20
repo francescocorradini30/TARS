@@ -34,8 +34,11 @@ class TARSBrain:
             self.client = ollama.Client(host=OLLAMA_BASE_URL)
 
     def _stream_groq(self, messages: list[dict]) -> Iterator[str]:
+        # max_tokens is a backstop against runaway monologues, not the primary
+        # length control (that's the system prompt). Set generously so it only
+        # ever trims a pathological ramble, never a genuine explanation (~250 tok).
         stream = self.client.chat.completions.create(
-            model=GROQ_MODEL, messages=messages, stream=True,
+            model=GROQ_MODEL, messages=messages, stream=True, max_tokens=400,
         )
         for chunk in stream:
             delta = chunk.choices[0].delta.content
