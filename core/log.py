@@ -44,11 +44,14 @@ class Phase:
 
 
 class Request:
-    __slots__ = ("id", "t0")
+    __slots__ = ("id", "t0", "barged_in")
 
     def __init__(self) -> None:
         self.id = _next_id()
         self.t0 = time.perf_counter()
+        # Set True by the rolling wake-word check when this utterance interrupts
+        # TARS mid-response, so _process_utterance always answers the full prompt.
+        self.barged_in = False
 
     def t(self) -> float:
         return time.perf_counter() - self.t0

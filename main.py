@@ -38,6 +38,13 @@ brain = TARSBrain()
 _tts_executor = ThreadPoolExecutor(max_workers=2)
 _pipeline_lock = threading.Lock()
 
+# Per-request cancellation. Each _run_pipeline owns its own Event and registers
+# it as _current_cancel while it holds the pipeline lock. A barge-in cancels that
+# specific pipeline — so the next request clearing ITS own token can never revive
+# an older, still-draining response (the bug that made two answers overlap).
+_cancel_lock = threading.Lock()
+_current_cancel: threading.Event | None = None
+
 
 def _timed_synthesize(text: str) -> tuple[bytes | None, float, str]:
     start = time.perf_counter()
@@ -56,9 +63,14 @@ def _wav_duration(audio_bytes: bytes) -> float:
         return 0.0
 
 
-def _barge_in() -> None:
-    """Tell the browser to drop any queued or playing audio. Invoked from stt
-    when wake-word interrupt fires while TARS is still producing sound."""
+def _request_interrupt() -> None:
+    """Barge-in: cancel the pipeline currently producing output (if any) and tell
+    the browser to drop queued/playing audio. Registered with stt as the wake-word
+    barge-in callback."""
+    with _cancel_lock:
+        ev = _current_cancel
+    if ev is not None:
+        ev.set()
     if _window is not None:
         _window.evaluate_js("interruptStream()")
 
@@ -103,10 +115,13 @@ def _extract_sentence(buffer: str, allow_comma: bool = False) -> tuple[str | Non
 
 
 def _run_pipeline(req: Request, text: str) -> None:
+    global _current_cancel
+    cancel = threading.Event()
     with req.phase("pipeline-wait-lock"):
         _pipeline_lock.acquire()
     try:
-        stt.interrupt_event.clear()
+        with _cancel_lock:
+            _current_cancel = cancel
         stt.pipeline_active = True
         sentence_buffer = ""
         full_response = ""
@@ -120,12 +135,21 @@ def _run_pipeline(req: Request, text: str) -> None:
                 future = future_queue.get()
                 if future is None:
                     break
-                audio_bytes, tts_dur, sent = future.result()
+                # Barge-in: drop the whole TTS backlog instantly instead of
+                # synthesizing ~20 queued sentences while TARS should be silent.
+                # This is what frees the pipeline lock fast enough to stop talking.
+                if cancel.is_set():
+                    future.cancel()
+                    continue
+                try:
+                    audio_bytes, tts_dur, sent = future.result()
+                except Exception:
+                    continue
                 preview = sent[:60].replace("\n", " ")
                 if len(sent) > 60:
                     preview += "..."
                 req.event("tts-sentence", f"{fmt_dur(tts_dur)} '{preview}'")
-                if audio_bytes and not stt.interrupt_event.is_set():
+                if audio_bytes and not cancel.is_set():
                     if not first_audio_logged:
                         req.event("first-audio-ready", fmt_dur(req.t()))
                         first_audio_logged = True
@@ -146,7 +170,7 @@ def _run_pipeline(req: Request, text: str) -> None:
                     if not ttft_logged:
                         req.event("llm-ttft", fmt_dur(time.perf_counter() - ttft_start))
                         ttft_logged = True
-                    if stt.interrupt_event.is_set():
+                    if cancel.is_set():
                         req.event("interrupt-detected", "stopping LLM stream")
                         break
                     sentence_buffer += chunk
@@ -161,7 +185,7 @@ def _run_pipeline(req: Request, text: str) -> None:
                         first_chunk_pending = False
                 llm_phase.note(f"{len(full_response)} chars")
 
-            if not stt.interrupt_event.is_set() and sentence_buffer.strip():
+            if not cancel.is_set() and sentence_buffer.strip():
                 future_queue.put(_tts_executor.submit(_timed_synthesize, sentence_buffer.strip()))
         except Exception as e:
             msg = str(e)
@@ -171,15 +195,18 @@ def _run_pipeline(req: Request, text: str) -> None:
                       "(need 545+), 2) `ollama --version` (update if old), 3) free VRAM with "
                       "`nvidia-smi` — Whisper medium uses ~1.5GB, llama3.2:3b ~2.5GB.")
         finally:
-            # Release pipeline_active FIRST so a queued interruption can resume
-            # immediately even if drain blocks. Then signal drain to stop and
-            # wait with a timeout so a stuck TTS can't hold the lock forever.
+            # Deregister our cancel token (only if it's still ours) and tell drain
+            # to stop. With the cancel-aware drain above, a barged-in pipeline
+            # drops its backlog and joins in milliseconds, so the lock frees fast.
             stt.pipeline_active = False
+            with _cancel_lock:
+                if _current_cancel is cancel:
+                    _current_cancel = None
             future_queue.put(None)
             with req.phase("drain-wait") as p:
                 drain_thread.join(timeout=10.0)
                 p.note("leaked" if drain_thread.is_alive() else "clean")
-            if stt.interrupt_event.is_set():
+            if cancel.is_set():
                 _window.evaluate_js("interruptStream()")
             else:
                 _window.evaluate_js("endTarsStream()")
@@ -198,7 +225,7 @@ def _on_utterance(text: str, req: Request) -> None:
 
 
 def _on_window_loaded():
-    stt.set_barge_in_callback(_barge_in)
+    stt.set_barge_in_callback(_request_interrupt)
     stt.start_listener(_on_utterance)
     _window.evaluate_js("setStatus('idle')")
 

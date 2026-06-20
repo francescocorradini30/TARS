@@ -18,6 +18,24 @@ SILENCE_CHUNKS    = 22            # ~0.70s of silence ends an utterance — long
                                   # off. Lower = snappier turns but more cutoffs.
 PRE_ROLL_CHUNKS   = 10            # ~0.32s pre-roll
 MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
+MAX_UTTERANCE_CHUNKS = int(SAMPLE_RATE * 12 / CHUNK_SAMPLES)  # force-end after
+                                  # ~12s even without silence, so a runaway blob
+                                  # (mic never goes quiet) still gets processed.
+
+# Mid-speech barge-in: while TARS is talking, periodically transcribe a short
+# rolling window of the in-progress utterance and fire the interrupt the instant
+# the wake word appears — instead of waiting for the whole sentence to finish.
+BARGE_CHECK_CHUNKS   = 12         # ~0.38s between checks (throttle)
+BARGE_WINDOW_CHUNKS  = 47         # ~1.5s of recent audio fed to each check
+BARGE_CHECK_TIMEOUT  = 3.0        # if a check runs longer than this, assume it
+                                  # hung and allow new checks (self-heal) so a
+                                  # single stuck transcribe can't permanently
+                                  # disable mid-speech detection.
+# Dedicated lightweight model for barge checks. Kept SEPARATE from the main en/it
+# model: running the rolling check concurrently on the shared ctranslate2 model
+# hung it and killed mid-speech detection for the rest of the session. base.en is
+# small + fast and only has to spot the wake word.
+BARGE_WHISPER_MODEL  = "base.en"
 
 # Addressee gating: English words = directed at TARS, Italian words = ignore.
 # Whisper's acoustic language detection mixes accent + content and fails in both
@@ -84,20 +102,21 @@ def _is_noise(text: str) -> bool:
     return text.lower().strip(" .,!?-") in _NOISE_TRANSCRIPTS
 
 
-# interrupt_event: set by _process_utterance when a new utterance is accepted
-# while TARS is still speaking. The LLM loop and drain thread in main.py poll
-# this to abort.
 # _speaker_busy_until: monotonic timestamp until which TARS is expected to still
 # be producing sound (LLM streaming or queued WAVs playing on JS side). Used to
-# decide whether an accepted utterance should barge in on the current response.
+# decide whether the wake word should barge in on the current response.
 # pipeline_active is kept for log diagnostics only — not used for gating.
-interrupt_event  = threading.Event()
+# Barge-in itself is driven by _barge_in_cb (registered by main.py), which cancels
+# the running pipeline and tells JS to drop its audio — no shared event here.
 pipeline_active: bool = False
 _speaker_busy_until: float = 0.0
 _speaker_lock = threading.Lock()
 _barge_in_cb = None
+_barge_checking: bool = False     # True while a mid-speech wake-word check runs
+_barge_check_started: float = 0.0  # monotonic start of the in-flight check
 
 _model: WhisperModel | None = None
+_barge_model: WhisperModel | None = None  # separate instance for barge checks
 _running: bool     = False
 _transcribing: bool = False   # True only during Whisper inference
 _transcribe_pool = ThreadPoolExecutor(max_workers=2)
@@ -141,11 +160,26 @@ def reset_speaker_busy() -> None:
 
 
 def set_barge_in_callback(cb) -> None:
-    """Register a callable invoked when a wake-word interrupt fires during
-    active speaker output. main.py uses this to call interruptStream() JS so
-    the browser silences any audio still playing or queued."""
+    """Register a callable invoked when the wake word fires during active speaker
+    output. main.py uses this to cancel the running pipeline and call
+    interruptStream() so the browser silences any audio still playing or queued."""
     global _barge_in_cb
     _barge_in_cb = cb
+
+
+def _do_barge_in(req: Request, reason: str) -> None:
+    """Stop the in-flight response right now: clear our speaker-busy timer and
+    invoke the registered callback (which cancels the pipeline + dumps JS audio)."""
+    reset_speaker_busy()
+    if _barge_in_cb is not None:
+        _barge_in_cb()
+    req.event("barge-in", reason)
+
+
+def _strip_wake(text: str) -> str:
+    """Remove the wake word so we can tell a bare 'tars' (just stop & listen)
+    from a real command like 'tars, tell me a joke'."""
+    return WAKE_RE.sub("", text).strip(" ,.!?-").strip()
 
 
 def _get_model() -> WhisperModel:
@@ -154,6 +188,14 @@ def _get_model() -> WhisperModel:
         compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
         _model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute)
     return _model
+
+
+def _get_barge_model() -> WhisperModel:
+    global _barge_model
+    if _barge_model is None:
+        compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+        _barge_model = WhisperModel(BARGE_WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute)
+    return _barge_model
 
 
 def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
@@ -173,6 +215,46 @@ def _transcribe(audio: np.ndarray, language: str) -> tuple[str, float]:
     text = " ".join(s.text for s in segs).strip()
     score = sum(s.avg_logprob for s in segs) / len(segs) if segs else -10.0
     return text, score
+
+
+def _transcribe_fast(audio: np.ndarray) -> str:
+    """Single-pass, greedy English transcription used only for mid-speech
+    wake-word detection. Runs on the dedicated lightweight model so it never
+    contends with the main en/it transcribes; beam_size=1 keeps it fast enough
+    to run every ~0.4s without starving the audio loop."""
+    segments, _ = _get_barge_model().transcribe(
+        audio,
+        language='en',
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=200),
+        condition_on_previous_text=False,
+        beam_size=1,
+    )
+    return " ".join(s.text for s in segments).strip()
+
+
+def _barge_check(window: np.ndarray, req: Request) -> None:
+    """Worker thread: if the rolling window contains the wake word and TARS is
+    still speaking, interrupt immediately. The full utterance keeps accumulating
+    in the listener and is transcribed + processed normally at its end, so no
+    spoken word is lost."""
+    global _barge_checking
+    try:
+        if not speaker_active():
+            return
+        text = _transcribe_fast(window)
+        if text and WAKE_RE.search(text) and not _is_noise(text) and speaker_active():
+            req.barged_in = True
+            _do_barge_in(req, f"wake word mid-speech '{text[:40]}'")
+    finally:
+        _barge_checking = False
+
+
+def _start_barge_check(window: np.ndarray, req: Request) -> None:
+    global _barge_checking, _barge_check_started
+    _barge_checking = True
+    _barge_check_started = time.monotonic()
+    threading.Thread(target=_barge_check, args=(window, req), daemon=True).start()
 
 
 def _dispatch_or_queue(req: Request, audio: np.ndarray, callback) -> None:
@@ -242,39 +324,40 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
     has_wake = bool(en_text and WAKE_RE.search(en_text) and not _is_noise(en_text))
     busy = speaker_active()
 
-    # No echo gate: the user runs TARS on headphones, so the mic never hears
-    # TARS's own output. That assumption is what makes mid-speech barge-in work
-    # — without echo, a real interrupting utterance closes normally (the old
-    # gate waited for silence that never came while TARS echoed into the mic).
-    def _maybe_interrupt(reason: str) -> None:
-        # If TARS is still producing sound when we accept an utterance, abort the
-        # running LLM loop and tell JS to dump its audio queue so the new turn
-        # starts immediately.
-        if busy:
-            interrupt_event.set()
-            reset_speaker_busy()
-            if _barge_in_cb is not None:
-                _barge_in_cb()
-            req.event("interrupt-set", reason)
-
-    # Wake word path: always accept, interrupting if TARS is mid-response.
-    if has_wake:
-        _maybe_interrupt("wake word during speech")
-        req.event("accept", "wake word match")
+    def _accept_barge(reason: str) -> None:
+        # ChatGPT-style: a barge-in answers the WHOLE prompt we just captured.
+        # If the rolling check hasn't already stopped TARS, stop it now.
+        if speaker_active():
+            _do_barge_in(req, reason)
+        # Bare "tars" with no command → just stop and keep listening, no reply.
+        if not _strip_wake(en_text):
+            req.event("drop", "bare wake word — stopped, listening")
+            return
+        req.event("accept", reason)
         callback(en_text, req)
+
+    # The rolling check already barged in mid-utterance → always answer it.
+    if req.barged_in:
+        _accept_barge("barge-in prompt")
         return
 
-    # Italian fits the audio better → user spoke Italian → ignore.
+    # While TARS is speaking, ONLY the wake word "tars" interrupts. Anything else
+    # the mic catches during playback is ignored so TARS isn't cut off by random
+    # talk. (Headphones: the mic never hears TARS, so this only ever sees you.)
+    if busy:
+        if has_wake:
+            _accept_barge("wake word during speech")
+        else:
+            req.event("drop", "speaker active without wake word")
+        return
+
+    # Idle: normal addressee gate — English = talking to TARS, Italian = ignore.
     if it_score > en_score:
         req.event("drop", f"it wins (en={en_score:.2f} it={it_score:.2f})")
         return
-
     if not en_text or _is_noise(en_text):
         req.event("drop", "en empty or noise")
         return
-    # English directed at TARS while it's speaking also barges in — you don't
-    # have to say "tars" to cut it off, just talk to it.
-    _maybe_interrupt("english during speech")
     req.event("accept")
     callback(en_text, req)
 
@@ -284,6 +367,7 @@ def _listener_loop_inner(callback) -> None:
     utterance:     list = []
     in_speech            = False
     silence_count        = 0
+    chunks_since_check   = 0
     req: Request | None  = None
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
@@ -301,33 +385,54 @@ def _listener_loop_inner(callback) -> None:
                     in_speech = True
                     utterance = list(pre_buffer) + [chunk]
                     silence_count = 0
+                    chunks_since_check = 0
                     req = Request()
-                    # Note: we do NOT set interrupt_event here. VAD energy alone
-                    # is a noisy signal (echo, keyboard, breath all trigger it);
-                    # interrupting on raw energy kills real responses with false
-                    # positives. The interrupt fires later, in _process_utterance,
-                    # only when Whisper has confirmed real wake-word speech.
+                    # Note: we do NOT barge in on raw VAD energy. Energy alone is
+                    # noisy (keyboard, breath all trigger it); interrupting on it
+                    # kills real responses with false positives. Barge-in fires
+                    # only once Whisper confirms the wake word — instantly via the
+                    # rolling _barge_check, or at utterance end in _process_utterance.
                     req.event("vad-speech-start", f"speaker_active={speaker_active()}")
             else:
                 utterance.append(chunk)
                 if not is_speech:
                     silence_count += 1
-                    if silence_count >= SILENCE_CHUNKS:
-                        in_speech = False
-                        audio = np.concatenate(utterance)
-                        audio_sec = len(audio) / SAMPLE_RATE
-                        utterance = []
-                        pre_buffer = []
-                        silence_count = 0
-                        assert req is not None
-                        req.event("vad-utterance-end", f"audio {audio_sec:.2f}s")
-                        if len(audio) >= MIN_AUDIO_SAMPLES:
-                            _dispatch_or_queue(req, audio, callback)
-                        else:
-                            req.event("drop", f"audio too short ({audio_sec:.2f}s)")
-                        req = None
                 else:
                     silence_count = 0
+
+                ended_on_silence = silence_count >= SILENCE_CHUNKS
+                if ended_on_silence or len(utterance) >= MAX_UTTERANCE_CHUNKS:
+                    in_speech = False
+                    audio = np.concatenate(utterance)
+                    audio_sec = len(audio) / SAMPLE_RATE
+                    utterance = []
+                    pre_buffer = []
+                    silence_count = 0
+                    assert req is not None
+                    tag = "audio" if ended_on_silence else "max-dur"
+                    req.event("vad-utterance-end", f"{tag} {audio_sec:.2f}s")
+                    if len(audio) >= MIN_AUDIO_SAMPLES:
+                        _dispatch_or_queue(req, audio, callback)
+                    else:
+                        req.event("drop", f"audio too short ({audio_sec:.2f}s)")
+                    req = None
+                    continue
+
+                # Still mid-utterance: if TARS is talking over us, poll a rolling
+                # window for the wake word so "tars" cuts it off instantly instead
+                # of at end-of-sentence. The utterance keeps growing for the normal
+                # end-of-turn transcription. A check that runs past BARGE_CHECK_TIMEOUT
+                # is treated as hung so it can't permanently disable detection.
+                checking = _barge_checking and (
+                    time.monotonic() - _barge_check_started < BARGE_CHECK_TIMEOUT)
+                if speaker_active() and not checking:
+                    chunks_since_check += 1
+                    if chunks_since_check >= BARGE_CHECK_CHUNKS:
+                        chunks_since_check = 0
+                        window = np.concatenate(utterance[-BARGE_WINDOW_CHUNKS:])
+                        _start_barge_check(window, req)
+                elif not speaker_active():
+                    chunks_since_check = 0
 
 
 def _listener_loop(callback) -> None:
@@ -348,6 +453,10 @@ def _warmup() -> None:
     dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
     try:
         _get_model().transcribe(dummy, language='en', beam_size=1)
+    except Exception:
+        pass
+    try:
+        _get_barge_model().transcribe(dummy, language='en', beam_size=1)
     except Exception:
         pass
 
