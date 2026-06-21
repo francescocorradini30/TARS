@@ -26,5 +26,6 @@ voice_samples/
 # persistent memory (local-only: session DB + user profile)
 data/
 
-# project docs (local only)
+# project docs / personal backlog (local only)
 CLAUDE.md
+NOTES.md
