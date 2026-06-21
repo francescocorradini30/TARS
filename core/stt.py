@@ -26,7 +26,14 @@ MAX_UTTERANCE_CHUNKS = int(SAMPLE_RATE * 12 / CHUNK_SAMPLES)  # force-end after
 # rolling window of the in-progress utterance and fire the interrupt the instant
 # the wake word appears — instead of waiting for the whole sentence to finish.
 BARGE_CHECK_CHUNKS   = 12         # ~0.38s between checks (throttle)
-BARGE_WINDOW_CHUNKS  = 47         # ~1.5s of recent audio fed to each check
+BARGE_WINDOW_CHUNKS  = 94         # ~3.0s of recent audio fed to each check. The
+                                  # wake word almost always sits at the START of a
+                                  # barge-in ("TARS, let's talk about..."); a 1.5s
+                                  # window let it scroll out of view before a check
+                                  # caught it, so the interrupt missed and TARS kept
+                                  # talking over you. 3s keeps it in frame for ~8
+                                  # checks → the stop fires reliably. base.en greedy
+                                  # on 3s is still well under BARGE_CHECK_TIMEOUT.
 BARGE_CHECK_TIMEOUT  = 3.0        # if a check runs longer than this, assume it
                                   # hung and allow new checks (self-heal) so a
                                   # single stuck transcribe can't permanently
@@ -318,15 +325,28 @@ def _release_or_chain(callback) -> None:
 
 
 def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
+    # Is this utterance aimed at TARS by *context* rather than by the language gate?
+    # Two cases: a confirmed mid-speech barge-in, or speech captured while TARS was
+    # still talking. In both, the WAKE WORD decides — not the en/it comparison — so
+    # the Italian pass is dead weight. Skipping it halves transcription latency on
+    # exactly the path that hurts most: cutting TARS off to say something new.
+    directed = req.barged_in or speaker_active()
     try:
         with req.phase("stt-transcribe") as p:
-            # Run both transcriptions in parallel — faster_whisper releases the GIL
-            # during ctranslate2 inference, so this overlaps the en/it passes.
+            # faster_whisper releases the GIL during ctranslate2 inference, so the
+            # en/it passes overlap when we actually need both.
             en_future = _transcribe_pool.submit(_transcribe, audio, 'en', HOTWORDS)
-            it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
-            en_text, en_score = en_future.result()
-            it_text, it_score = it_future.result()
-            p.note(f"en={en_score:.2f} '{en_text}' | it={it_score:.2f} '{it_text}'")
+            if directed:
+                # English-only: the addressee is already settled, so don't pay for
+                # the Italian pass (which on a single GPU serializes behind en).
+                en_text, en_score = en_future.result()
+                it_text, it_score = "", -10.0
+                p.note(f"en={en_score:.2f} '{en_text}' | it=skipped (directed)")
+            else:
+                it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
+                en_text, en_score = en_future.result()
+                it_text, it_score = it_future.result()
+                p.note(f"en={en_score:.2f} '{en_text}' | it={it_score:.2f} '{it_text}'")
     finally:
         # Free / hand off the Whisper gate the instant inference is done — BEFORE
         # running the (potentially multi-second) LLM+TTS pipeline via callback().
@@ -348,7 +368,12 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
         return
 
     has_wake = bool(en_text and WAKE_RE.search(en_text) and not _is_noise(en_text))
-    busy = speaker_active()
+    # Reuse the up-front context decision: if we treated this as directed-at-TARS
+    # (single English pass), the accept/drop branch must agree. Recomputing
+    # speaker_active() here could flip False mid-call (TARS's audio just ended) and
+    # send a wake-word-less, English-only utterance into the idle gate with a bogus
+    # it_score — so anchor to the same flag instead.
+    busy = directed
 
     def _accept_barge(reason: str) -> None:
         # ChatGPT-style: a barge-in answers the WHOLE prompt we just captured.
