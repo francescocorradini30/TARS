@@ -16,6 +16,25 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 
+# Which microphone the listener records from. Empty = the system default input.
+# Otherwise an index (run `python -c "import sounddevice as sd; print(sd.query_devices())"`)
+# or a name substring sounddevice matches. Pin a clean device here: a laptop's
+# built-in digital mic array can sit at a noise floor ABOVE STT_ENERGY_THRESHOLD,
+# which keeps the energy-VAD permanently "on" so utterances never close on silence
+# and every turn drags out to the max-duration cap. A real interface input is silent.
+_stt_dev = os.getenv("STT_INPUT_DEVICE", "").strip()
+if _stt_dev == "":
+    STT_INPUT_DEVICE = None
+elif _stt_dev.lstrip("-").isdigit():
+    STT_INPUT_DEVICE = int(_stt_dev)
+else:
+    STT_INPUT_DEVICE = _stt_dev
+
+# RMS energy above which a 32ms audio chunk counts as speech. The default suits a
+# clean mic; raise it if you're stuck on a noisy one (check the startup noise-floor
+# log — silence should sit comfortably below this).
+STT_ENERGY_THRESHOLD = float(os.getenv("STT_ENERGY_THRESHOLD", "0.012"))
+
 USER_NAME = os.getenv("USER_NAME", "Cooper")
 TARS_HUMOR = int(os.getenv("TARS_HUMOR", "75"))
 

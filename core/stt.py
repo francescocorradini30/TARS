@@ -5,12 +5,12 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from config import WHISPER_MODEL, WHISPER_DEVICE
+from config import WHISPER_MODEL, WHISPER_DEVICE, STT_INPUT_DEVICE, STT_ENERGY_THRESHOLD
 from core.log import Request
 
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
-ENERGY_THRESHOLD  = 0.012
+ENERGY_THRESHOLD  = STT_ENERGY_THRESHOLD   # see config.py / .env (STT_ENERGY_THRESHOLD)
 SILENCE_CHUNKS    = 22            # ~0.70s of silence ends an utterance — long
                                   # enough to ride out natural mid-sentence
                                   # pauses (thinking, breath, soft phonemes)
@@ -430,8 +430,8 @@ def _listener_loop_inner(callback) -> None:
     chunks_since_check   = 0
     req: Request | None  = None
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
-                        blocksize=CHUNK_SAMPLES) as stream:
+    with sd.InputStream(device=STT_INPUT_DEVICE, samplerate=SAMPLE_RATE, channels=1,
+                        dtype='float32', blocksize=CHUNK_SAMPLES) as stream:
         while _running:
             chunk, _ = stream.read(CHUNK_SAMPLES)
             chunk = chunk.flatten()
@@ -521,9 +521,46 @@ def _warmup() -> None:
         pass
 
 
+def _calibrate_noise_floor(seconds: float = 0.6) -> None:
+    """Sample the chosen input device for a moment at startup and report its ambient
+    RMS against ENERGY_THRESHOLD. If the floor sits at/above the threshold, the
+    energy-VAD treats constant noise as speech and NEVER closes an utterance on
+    silence — every turn then drags to the max-duration cap and a freshly-spoken
+    phrase can't even start a new utterance until the current 12s block ends. This
+    log is the first thing to read when TARS 'lags before it even hears you'."""
+    try:
+        frames = []
+        with sd.InputStream(device=STT_INPUT_DEVICE, samplerate=SAMPLE_RATE,
+                            channels=1, dtype='float32', blocksize=CHUNK_SAMPLES) as s:
+            for _ in range(int(SAMPLE_RATE * seconds / CHUNK_SAMPLES)):
+                c, _ = s.read(CHUNK_SAMPLES)
+                frames.append(float(np.sqrt(np.mean(c.flatten() ** 2))))
+        if not frames:
+            return
+        arr = np.array(frames)
+        floor = float(np.median(arr))
+        above = float((arr > ENERGY_THRESHOLD).mean()) * 100.0
+        try:
+            idx = STT_INPUT_DEVICE if STT_INPUT_DEVICE is not None else sd.default.device[0]
+            dev_name = sd.query_devices(idx)["name"]
+        except Exception:
+            dev_name = str(STT_INPUT_DEVICE)
+        max_dur = MAX_UTTERANCE_CHUNKS * CHUNK_SAMPLES / SAMPLE_RATE
+        print(f"[STT] input device: {dev_name}")
+        print(f"[STT] noise floor (silent): median RMS={floor:.4f} | "
+              f"threshold={ENERGY_THRESHOLD:.4f} | {above:.0f}% of chunks above threshold")
+        if above > 30.0:
+            print(f"[STT] WARNING: ambient noise exceeds the VAD threshold — the listener "
+                  f"may never detect silence and utterances will max out at {max_dur:.0f}s. "
+                  f"Raise STT_ENERGY_THRESHOLD or pick a cleaner STT_INPUT_DEVICE in .env.")
+    except Exception as e:
+        print(f"[STT] noise-floor calibration skipped: {type(e).__name__}: {e}")
+
+
 def start_listener(callback) -> None:
     global _running
     _running = True
+    _calibrate_noise_floor()
     threading.Thread(target=_warmup, daemon=True).start()
     threading.Thread(target=_listener_loop, args=(callback,), daemon=True).start()
 
