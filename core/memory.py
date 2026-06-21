@@ -33,7 +33,7 @@ from config import (
     CONSOLIDATION_BACKEND, GROQ_API_KEY, GROQ_MODEL,
     OLLAMA_MODEL, OLLAMA_BASE_URL,
     MEMORY_RECENT_SESSIONS, MEMORY_MAX_FACTS,
-    MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE,
+    MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE, MEMORY_COMPACTION,
 )
 
 # Profile shape. Lists of short strings, distilled over time. Kept deliberately
@@ -320,6 +320,18 @@ class MemoryStore:
                 # so the next launch retries it; the raw turns are safe in the journal.
                 print(f"[MEMORY] consolidation failed for session {r['id']}: "
                       f"{type(e).__name__}: {e}")
+        # Now that fresh data has landed, tighten the store: merge redundant profile
+        # entries and de-duplicate episodic rows. Once per batch, never in the
+        # conversation path, and never allowed to crash shutdown/recovery.
+        if done and MEMORY_COMPACTION:
+            try:
+                self.compact_profile()
+            except Exception as e:
+                print(f"[MEMORY] profile compaction skipped: {type(e).__name__}: {e}")
+            try:
+                self.dedup_memories()
+            except Exception as e:
+                print(f"[MEMORY] memories dedup skipped: {type(e).__name__}: {e}")
         return done
 
     def _consolidate_one(self, session_id: int) -> None:
@@ -401,6 +413,89 @@ class MemoryStore:
             )
             self._conn.commit()
 
+    # -- compaction (write-side, LLM) ----------------------------------------
+    def compact_profile(self) -> int:
+        """Merge near-duplicate profile entries into single sharper phrases via one
+        LLM pass. Returns how many entries were removed (0 if nothing to do). The
+        .prev backup written by _save_profile covers a bad pass."""
+        profile = self.load_profile()
+        before = sum(len(profile.get(k) or []) for k in _EMPTY_PROFILE)
+        if before < 2:
+            return 0
+        merged = _compact_profile_llm(profile)
+        if not isinstance(merged, dict):
+            return 0
+        # Accept only something shaped like our profile that didn't wipe everything.
+        clean = {k: [str(x).strip() for x in (merged.get(k) or []) if str(x).strip()]
+                 for k in _EMPTY_PROFILE}
+        after = sum(len(clean[k]) for k in _EMPTY_PROFILE)
+        if after == 0:
+            print("[MEMORY] profile compaction returned empty — keeping current profile")
+            return 0
+        removed = before - after
+        if removed <= 0:
+            return 0  # nothing actually merged; don't rewrite the file needlessly
+        self._save_profile(clean)
+        print(f"[MEMORY] profile compacted: {before} -> {after} entries "
+              f"({removed} redundant merged)")
+        return removed
+
+    def dedup_memories(self) -> int:
+        """Collapse near-duplicate episodic memory rows. An LLM groups rows that
+        state the same thing; we keep the strongest row of each group (max salience,
+        summed recall, latest recency) and delete the rest. Returns rows removed."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, kind, content, salience, recall_count, last_seq FROM memories"
+            ).fetchall()
+        if len(rows) < 2:
+            return 0
+        by_id = {r["id"]: r for r in rows}
+        items = [{"id": r["id"], "kind": r["kind"], "content": r["content"]} for r in rows]
+        result = _dedup_memories_llm(items)
+        merges = result.get("merges") if isinstance(result, dict) else None
+        if not merges:
+            return 0
+
+        removed = 0
+        with self._lock:
+            for grp in merges:
+                raw_ids = grp.get("ids") if isinstance(grp, dict) else None
+                if not isinstance(raw_ids, list):
+                    continue
+                ids = []
+                for i in raw_ids:
+                    try:
+                        i = int(i)
+                    except (TypeError, ValueError):
+                        continue
+                    if i in by_id and i not in ids:
+                        ids.append(i)
+                if len(ids) < 2:
+                    continue
+                grp_rows = [by_id[i] for i in ids]
+                keep = max(grp_rows, key=lambda r: (r["salience"], r["last_seq"]))
+                content = str(grp.get("content") or keep["content"]).strip() or keep["content"]
+                kind = str(grp.get("kind", keep["kind"])).strip().lower()
+                if kind not in _KIND_LABELS:
+                    kind = keep["kind"]
+                self._conn.execute(
+                    "UPDATE memories SET content=?, kind=?, salience=?, recall_count=?, "
+                    "last_seq=? WHERE id=?",
+                    (content, kind, max(r["salience"] for r in grp_rows),
+                     sum(r["recall_count"] for r in grp_rows),
+                     max(r["last_seq"] for r in grp_rows), keep["id"]),
+                )
+                drop_ids = [i for i in ids if i != keep["id"]]
+                self._conn.executemany(
+                    "DELETE FROM memories WHERE id=?", [(i,) for i in drop_ids])
+                removed += len(drop_ids)
+            if removed:
+                self._conn.commit()
+        if removed:
+            print(f"[MEMORY] memories de-duplicated: removed {removed} duplicate row(s)")
+        return removed
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -434,16 +529,9 @@ it. Add new durable traits. Keep each entry a short phrase. Don't duplicate.
 """
 
 
-def _consolidation_llm(transcript: str, current_profile: dict) -> dict:
-    """One JSON-returning LLM call. Backend per config (groq default, ollama local)."""
-    system = _CONSOLIDATION_SYSTEM.format(user=USER_NAME)
-    user = (
-        "CURRENT PROFILE:\n"
-        + json.dumps({k: current_profile.get(k, []) for k in _EMPTY_PROFILE},
-                     ensure_ascii=False, indent=2)
-        + "\n\nSESSION TRANSCRIPT:\n" + transcript
-    )
-
+def _chat_json(system: str, user: str) -> dict:
+    """One JSON-returning chat call on the configured consolidation backend (groq
+    default, ollama local). Shared by the consolidation + compaction passes."""
     if CONSOLIDATION_BACKEND == "ollama":
         import ollama
         client = ollama.Client(host=OLLAMA_BASE_URL)
@@ -470,5 +558,77 @@ def _consolidation_llm(transcript: str, current_profile: dict) -> dict:
             response_format={"type": "json_object"},
         )
         raw = resp.choices[0].message.content
-
     return json.loads(raw)
+
+
+def _consolidation_llm(transcript: str, current_profile: dict) -> dict:
+    """Distill one session into summary + facts + refreshed profile (one LLM call)."""
+    system = _CONSOLIDATION_SYSTEM.format(user=USER_NAME)
+    user = (
+        "CURRENT PROFILE:\n"
+        + json.dumps({k: current_profile.get(k, []) for k in _EMPTY_PROFILE},
+                     ensure_ascii=False, indent=2)
+        + "\n\nSESSION TRANSCRIPT:\n" + transcript
+    )
+    return _chat_json(system, user)
+
+
+# -- compaction passes (keep the persistent store tight) ---------------------
+_PROFILE_COMPACT_SYSTEM = """You tighten TARS's long-term profile of {user}. You are \
+given the current profile — seven lists of short phrases. Within a list, some entries \
+say the same or nearly the same thing in different words. Merge each such redundant \
+cluster into ONE sharper, cleaner phrase.
+
+Reply with ONLY a JSON object — the FULL profile in exactly this shape:
+{{
+  "identity": [], "preferences": [], "likes": [], "dislikes": [],
+  "annoyances": [], "recurring_requests": [], "relationship_notes": []
+}}
+
+Rules:
+- ONLY merge entries that are genuinely redundant (the same fact, trait or feeling). \
+Keep every DISTINCT piece of information — never drop something just to shorten.
+- A merged entry must preserve the full meaning AND the most specific detail of \
+everything it replaces — keep concrete specifics (names, song titles, places, facts), \
+never generalize them away (e.g. don't turn "favorite song is Purple Rain" into "likes \
+music"). Prefer the clearest, most informative wording.
+- Do NOT invent anything not supported by the existing entries. Do NOT move entries \
+between categories unless one is plainly in the wrong list.
+- Keep each entry a short phrase. Return every category key, even if its list is empty.
+"""
+
+
+def _compact_profile_llm(profile: dict) -> dict:
+    system = _PROFILE_COMPACT_SYSTEM.format(user=USER_NAME)
+    user = "CURRENT PROFILE:\n" + json.dumps(
+        {k: profile.get(k, []) for k in _EMPTY_PROFILE}, ensure_ascii=False, indent=2)
+    return _chat_json(system, user)
+
+
+_MEMORIES_DEDUP_SYSTEM = """You de-duplicate TARS's episodic memory about {user}. You \
+are given a numbered list of remembered facts/events, each with an id. Some say the \
+same thing in different words. Group ONLY the genuine duplicates.
+
+Reply with ONLY a JSON object in exactly this shape:
+{{
+  "merges": [
+    {{"ids": [1, 4], "content": "one sharp phrasing covering them", "kind": "preference|like|dislike|annoyance|request|event|identity|misc"}}
+  ]
+}}
+
+Rules:
+- Only group items stating the SAME fact/event/trait. Do NOT group things that are \
+merely related or topically similar but distinct (a one-off event is not the same as a \
+standing preference).
+- Every group MUST have 2+ ids. Omit anything with no duplicate (don't list singletons).
+- "content" = a single clean phrase that keeps the MOST SPECIFIC detail of the group \
+(names, song titles, concrete facts) — never generalize the detail away; "kind" = the \
+best-fitting one.
+- Do NOT invent facts. If there are no duplicates at all, return {{"merges": []}}.
+"""
+
+
+def _dedup_memories_llm(items: list[dict]) -> dict:
+    system = _MEMORIES_DEDUP_SYSTEM.format(user=USER_NAME)
+    listing = "\n".join(f"{it['id']}. [{it['kind']}] {it['content']}" for it in items)
+    return _chat_json(system, "REMEMBERED ITEMS:\n" + listing)

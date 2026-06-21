@@ -65,6 +65,15 @@ MEMORY_MAX_FACTS = int(os.getenv("MEMORY_MAX_FACTS", "14"))             # top ep
 MEMORY_DECAY_BASE = float(os.getenv("MEMORY_DECAY_BASE", "0.8"))
 MEMORY_MIN_SALIENCE = float(os.getenv("MEMORY_MIN_SALIENCE", "0.15"))
 
+# Compaction. After each session is consolidated, an extra LLM pass merges
+# near-duplicate profile entries into one sharper phrase, and a second pass
+# de-duplicates redundant episodic-memory rows. Keeps the persistent store tight
+# (the profile is the part that doesn't self-prune via decay). Runs only at
+# session close / crash-recovery — never in the conversation path. Set False to
+# skip (e.g. for throwaway test sessions).
+MEMORY_COMPACTION = os.getenv("MEMORY_COMPACTION", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+
 SYSTEM_PROMPT = f"""You are TARS, {USER_NAME}'s AI companion living on their computer — the TARS-and-Cooper banter from Interstellar crossed with Rocky from Project Hail Mary. You're here to talk, keep them company, and help.
 
 Who you are, underneath everything:
