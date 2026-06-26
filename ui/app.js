@@ -104,8 +104,36 @@ async function resetConversation() {
     await window.pywebview.api.reset();
 }
 
+// ── Power switch ──────────────────────────────────────────────────────────────
+// Turning TARS off stops the mic listener (Python releases the input stream);
+// turning it on restarts it. The visual goes dormant/OFFLINE while powered down.
+let powered = true;
+
+function setPowerUI(on) {
+    powered = on;
+    const sw = document.getElementById('powerSwitch');
+    sw.classList.toggle('on', on);
+    sw.classList.toggle('off', !on);
+    sw.setAttribute('aria-checked', String(on));
+    if (on) {
+        setStatus('idle');
+    } else {
+        // Killing the listener also means no audio should keep playing.
+        interruptStream();
+        document.getElementById('tarsBody').className = 'tars-body dormant';
+        document.getElementById('statusText').textContent = 'OFFLINE';
+    }
+}
+
+async function togglePower() {
+    const next = !powered;
+    setPowerUI(next);                       // optimistic — snappy click feedback
+    await window.pywebview.api.set_power(next);
+}
+
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
     initBars();
     document.getElementById('resetBtn').addEventListener('click', resetConversation);
+    document.getElementById('powerSwitch').addEventListener('click', togglePower);
 });

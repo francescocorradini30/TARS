@@ -274,6 +274,18 @@ class TARSAPI:
     def reset(self) -> None:
         brain.reset()
 
+    def set_power(self, on: bool) -> dict:
+        """Power TARS's ear on/off from the UI switch. Off stops the listener loop,
+        which closes the sounddevice InputStream and releases the mic; on restarts
+        it (models stay loaded, so it's instant). The barge-in callback is already
+        registered for the process lifetime, so we only toggle the listener."""
+        if on:
+            stt.start_listener(_on_utterance)
+        else:
+            stt.stop_listener()
+        print(f"[POWER] TARS listener {'ON' if on else 'OFF'}")
+        return {"on": on}
+
 
 if __name__ == "__main__":
     # Cloud backend (groq) needs neither a local Ollama server nor a GPU warmup —

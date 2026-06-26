@@ -217,9 +217,75 @@ body::after {
 
 .fill { color: var(--green-dim); }
 
+/* Footer controls (pinned to the bottom of the panel) */
+.controls {
+    margin-top: auto;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+}
+
+/* Power switch */
+.power-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+}
+
+.power-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--muted);
+}
+
+.power-switch {
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+}
+
+/* Blocky rather than rounded — matches the panel's CRT/terminal look. */
+.switch-track {
+    display: block;
+    position: relative;
+    width: 46px;
+    height: 22px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.switch-knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    background: var(--muted);
+    transition: left 0.25s cubic-bezier(.5, 0, .3, 1.4), background 0.3s, box-shadow 0.3s;
+}
+
+/* ON: knob slides right, lights up green like the listening state. */
+.power-switch.on .switch-track {
+    border-color: var(--green);
+    box-shadow: 0 0 12px var(--green-glow);
+}
+.power-switch.on .switch-knob {
+    left: 26px;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+}
+
+/* OFF: knob parks left, everything goes dim. */
+.power-switch.off .switch-track { border-color: var(--border); box-shadow: none; }
+.power-switch.off .switch-knob  { left: 2px; background: var(--muted); box-shadow: none; }
+
 /* Reset button */
 .reset-btn {
-    margin-top: auto;
     background: transparent;
     border: 1px solid var(--border);
     color: var(--muted);
