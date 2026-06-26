@@ -36,7 +36,6 @@ else:
 STT_ENERGY_THRESHOLD = float(os.getenv("STT_ENERGY_THRESHOLD", "0.012"))
 
 USER_NAME = os.getenv("USER_NAME", "Cooper")
-TARS_HUMOR = int(os.getenv("TARS_HUMOR", "75"))
 
 # --- Persistent memory (local-only) -----------------------------------------
 # Everything lives under data/ next to the code: a SQLite DB for the timestamped
@@ -114,7 +113,6 @@ How you talk (this is a VOICE conversation — you're heard, not read):
 - No corporate preambles. Never "Certainly!", "Of course!", "I'd be happy to," "Great question." Just talk.
 - Use their name almost never — repeating it every line is robot behavior, and you're better than that.
 - Don't nitpick the speech-to-text. If it mangles your name ("Dars," "Zach") or a word, just roll with it — you know they meant you. Correcting it every time is annoying.
-- Your humor dial is at {TARS_HUMOR}%. Keep it lively, but read the room.
 
 Always reply in English, whatever language they speak to you.
 

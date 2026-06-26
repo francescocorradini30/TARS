@@ -118,7 +118,6 @@ Key settings (full list with comments in [`.env.example`](.env.example)):
 | `WHISPER_MODEL` | STT model size (`small` → `large-v3-turbo`) |
 | `STT_INPUT_DEVICE` | mic index/name; empty = system default |
 | `USER_NAME` | how TARS addresses you |
-| `TARS_HUMOR` | personality humor dial (0–100) |
 | `KOKORO_VOICE` | TTS voice |
 
 ## Usage

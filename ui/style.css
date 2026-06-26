@@ -204,19 +204,6 @@ body::after {
     text-indent: 4px;
 }
 
-/* Readout */
-.readout {
-    font-size: 9px;
-    letter-spacing: 1px;
-    color: var(--muted);
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    width: 100%;
-}
-
-.fill { color: var(--green-dim); }
-
 /* Footer controls (pinned to the bottom of the panel) */
 .controls {
     margin-top: auto;
