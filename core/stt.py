@@ -11,7 +11,7 @@ from core.log import Request
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
 ENERGY_THRESHOLD  = STT_ENERGY_THRESHOLD   # see config.py / .env (STT_ENERGY_THRESHOLD)
-SILENCE_CHUNKS    = 22            # ~0.70s of silence ends an utterance — long
+SILENCE_CHUNKS    = 26            # ~0.83s of silence ends an utterance — long
                                   # enough to ride out natural mid-sentence
                                   # pauses (thinking, breath, soft phonemes)
                                   # so we don't ship a fragment and cut the user
