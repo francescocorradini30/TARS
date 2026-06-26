@@ -5,7 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from config import WHISPER_MODEL, WHISPER_DEVICE, STT_INPUT_DEVICE, STT_ENERGY_THRESHOLD
+from config import (
+    WHISPER_MODEL, WHISPER_DEVICE, STT_INPUT_DEVICE, STT_ENERGY_THRESHOLD,
+    STT_DEVICE_PRIORITY,
+)
 from core.log import Request
 
 SAMPLE_RATE       = 16000
@@ -430,7 +433,7 @@ def _listener_loop_inner(callback) -> None:
     chunks_since_check   = 0
     req: Request | None  = None
 
-    with sd.InputStream(device=STT_INPUT_DEVICE, samplerate=SAMPLE_RATE, channels=1,
+    with sd.InputStream(device=_input_device, samplerate=SAMPLE_RATE, channels=1,
                         dtype='float32', blocksize=CHUNK_SAMPLES) as stream:
         while _running:
             chunk, _ = stream.read(CHUNK_SAMPLES)
@@ -521,6 +524,36 @@ def _warmup() -> None:
         pass
 
 
+# Resolved at start_listener() from STT_INPUT_DEVICE (handles the "auto" priority
+# pick). The listener loop + calibration read this, never STT_INPUT_DEVICE directly.
+_input_device = None
+
+
+def _resolve_input_device():
+    """Decide which mic to record from. An explicit index/name in STT_INPUT_DEVICE is
+    used as-is; "auto" walks STT_DEVICE_PRIORITY (Redmi Buds 6 -> Focusrite -> ...) and
+    returns the first connected input device whose name matches, falling back to the
+    system default (the laptop's built-in mic) when none are present. Re-run on every
+    start_listener() call, so plugging the earbuds in and toggling power picks them up.
+    Returns a device index, or None for the system default."""
+    if STT_INPUT_DEVICE != "auto":
+        return STT_INPUT_DEVICE
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        print(f"[STT] device scan failed ({type(e).__name__}: {e}) — system default")
+        return None
+    inputs = [(i, d) for i, d in enumerate(devices) if d.get("max_input_channels", 0) > 0]
+    for pref in STT_DEVICE_PRIORITY:
+        needle = pref.lower()
+        for i, d in inputs:
+            if needle in d["name"].lower():
+                print(f"[STT] auto-selected mic: [{i}] {d['name'].strip()} (matched '{pref}')")
+                return i
+    print("[STT] auto: no preferred mic connected — using system default (laptop mic)")
+    return None
+
+
 def _calibrate_noise_floor(seconds: float = 0.6) -> None:
     """Sample the chosen input device for a moment at startup and report its ambient
     RMS against ENERGY_THRESHOLD. If the floor sits at/above the threshold, the
@@ -530,7 +563,7 @@ def _calibrate_noise_floor(seconds: float = 0.6) -> None:
     log is the first thing to read when TARS 'lags before it even hears you'."""
     try:
         frames = []
-        with sd.InputStream(device=STT_INPUT_DEVICE, samplerate=SAMPLE_RATE,
+        with sd.InputStream(device=_input_device, samplerate=SAMPLE_RATE,
                             channels=1, dtype='float32', blocksize=CHUNK_SAMPLES) as s:
             for _ in range(int(SAMPLE_RATE * seconds / CHUNK_SAMPLES)):
                 c, _ = s.read(CHUNK_SAMPLES)
@@ -541,7 +574,7 @@ def _calibrate_noise_floor(seconds: float = 0.6) -> None:
         floor = float(np.median(arr))
         above = float((arr > ENERGY_THRESHOLD).mean()) * 100.0
         try:
-            idx = STT_INPUT_DEVICE if STT_INPUT_DEVICE is not None else sd.default.device[0]
+            idx = _input_device if _input_device is not None else sd.default.device[0]
             dev_name = sd.query_devices(idx)["name"]
         except Exception:
             dev_name = str(STT_INPUT_DEVICE)
@@ -558,8 +591,9 @@ def _calibrate_noise_floor(seconds: float = 0.6) -> None:
 
 
 def start_listener(callback) -> None:
-    global _running
+    global _running, _input_device
     _running = True
+    _input_device = _resolve_input_device()
     _calibrate_noise_floor()
     threading.Thread(target=_warmup, daemon=True).start()
     threading.Thread(target=_listener_loop, args=(callback,), daemon=True).start()

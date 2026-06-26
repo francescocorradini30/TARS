@@ -16,19 +16,33 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 
-# Which microphone the listener records from. Empty = the system default input.
-# Otherwise an index (run `python -c "import sounddevice as sd; print(sd.query_devices())"`)
-# or a name substring sounddevice matches. Pin a clean device here: a laptop's
-# built-in digital mic array can sit at a noise floor ABOVE STT_ENERGY_THRESHOLD,
-# which keeps the energy-VAD permanently "on" so utterances never close on silence
-# and every turn drags out to the max-duration cap. A real interface input is silent.
-_stt_dev = os.getenv("STT_INPUT_DEVICE", "").strip()
+# Which microphone the listener records from. STT_INPUT_DEVICE accepts:
+#   - "auto" (default): pick automatically by STT_DEVICE_PRIORITY below — the first
+#     connected preferred device wins, otherwise the system default (laptop mic).
+#   - an index (run `python -c "import sounddevice as sd; print(sd.query_devices())"`)
+#     or a name substring: force that exact device.
+#   - empty: the system default input.
+# Auto/pinning a clean device matters: a laptop's built-in digital mic array can sit
+# at a noise floor ABOVE STT_ENERGY_THRESHOLD, which keeps the energy-VAD permanently
+# "on" so utterances never close on silence and every turn drags to the max-dur cap.
+_stt_dev = os.getenv("STT_INPUT_DEVICE", "auto").strip()
 if _stt_dev == "":
     STT_INPUT_DEVICE = None
+elif _stt_dev.lower() == "auto":
+    STT_INPUT_DEVICE = "auto"
 elif _stt_dev.lstrip("-").isdigit():
     STT_INPUT_DEVICE = int(_stt_dev)
 else:
     STT_INPUT_DEVICE = _stt_dev
+
+# Preference order for "auto" mic selection: comma-separated, case-insensitive name
+# substrings, highest priority first. The first connected input device whose name
+# contains one of these wins; if none match, the system default (laptop built-in) is
+# used. Default: Redmi Buds 6 (BT earbuds) -> Focusrite (interface) -> laptop mic.
+STT_DEVICE_PRIORITY = [
+    s.strip() for s in os.getenv(
+        "STT_DEVICE_PRIORITY", "redmi buds 6, focusrite").split(",") if s.strip()
+]
 
 # RMS energy above which a 32ms audio chunk counts as speech. The default suits a
 # clean mic; raise it if you're stuck on a noisy one (check the startup noise-floor
