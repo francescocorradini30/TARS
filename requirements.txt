@@ -16,3 +16,10 @@ soundfile
 # the CUDA libs ctranslate2/faster-whisper pulls in (cublas/cudnn/cudart/nvrtc).
 onnxruntime-gpu
 nvidia-cufft-cu12
+
+# Semantic memory recall (core/embeddings.py) runs a small MiniLM as plain ONNX on the
+# CPU via the onnxruntime above — deliberately NOT fastembed/sentence-transformers, which
+# would drag in a CPU `onnxruntime` (the conflict noted above) and torch. These two are
+# already transitive deps of faster-whisper; pinned here because we import them directly.
+huggingface_hub
+tokenizers

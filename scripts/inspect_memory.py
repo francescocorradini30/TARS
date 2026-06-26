@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (  # noqa: E402
     MEMORY_DB_PATH, PROFILE_PATH, MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE,
+    MEMORY_PROFILE_DECAY_BASE, MEMORY_MAX_PROFILE,
 )
 
 
@@ -49,6 +50,17 @@ def main() -> None:
         print(f"    end:   {s['ended_at'] or '(still open / not closed cleanly)'}")
         print(f"    recap: {s['summary'] or '(not consolidated yet)'}")
 
+    # Semantic-recall coverage: how many memories carry an embedding vector.
+    try:
+        embedded = conn.execute(
+            "SELECT COUNT(*) AS n FROM memories WHERE embedding IS NOT NULL").fetchone()["n"]
+        pvec = conn.execute("SELECT COUNT(*) AS n FROM profile_vectors").fetchone()["n"]
+        print(f"\n[semantic recall] {embedded} memory vector(s), {pvec} profile vector(s) "
+              "(backfilled at startup by ensure_embeddings)")
+    except sqlite3.OperationalError:
+        print("\n[semantic recall] no embedding columns yet — run the app once with "
+              "MEMORY_SEMANTIC_RECALL on")
+
     _rule(f"EPISODIC MEMORIES  (decay base={MEMORY_DECAY_BASE}, floor={MEMORY_MIN_SALIENCE})")
     mems = conn.execute(
         "SELECT id, session_id, created_at, kind, content, salience, "
@@ -67,14 +79,38 @@ def main() -> None:
 
     conn.close()
 
-    _rule("USER PROFILE (profile.json)")
+    _rule(f"USER PROFILE  (decay base={MEMORY_PROFILE_DECAY_BASE}, "
+          f"inject cap={MEMORY_MAX_PROFILE}, identity always shown)")
     try:
         with open(PROFILE_PATH, "r", encoding="utf-8") as f:
-            print(json.dumps(json.load(f), indent=2, ensure_ascii=False))
+            prof = json.load(f)
     except FileNotFoundError:
         print("(no profile.json yet — appears after the first session is consolidated)")
+        return
     except json.JSONDecodeError as e:
         print(f"(profile.json is corrupt: {e})")
+        return
+
+    for k, entries in prof.items():
+        if k == "updated_at" or not isinstance(entries, list):
+            continue
+        print(f"\n[{k}]")
+        if not entries:
+            print("    (none)")
+        for e in entries:
+            # Entries are {text, salience, last_seen}; tolerate legacy bare strings too.
+            if isinstance(e, dict):
+                sal = float(e.get("salience", 0.0))
+                last_seen = int(e.get("last_seen", max_id))
+                elapsed = max(0, max_id - last_seen)
+                eff = sal * (MEMORY_PROFILE_DECAY_BASE ** elapsed)
+                pin = k == "identity"
+                faded = "  <faded>" if (eff < MEMORY_MIN_SALIENCE and not pin) else ""
+                tag = "pinned" if pin else f"eff={eff:.2f}"
+                print(f"    - {e.get('text', '')}")
+                print(f"        salience={sal:.2f}  {tag}{faded}")
+            else:
+                print(f"    - {e}")
 
 
 if __name__ == "__main__":

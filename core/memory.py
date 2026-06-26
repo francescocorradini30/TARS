@@ -28,16 +28,24 @@ import sqlite3
 import threading
 from datetime import datetime
 
+import numpy as np
+
 from config import (
     MEMORY_DB_PATH, PROFILE_PATH, USER_NAME,
     CONSOLIDATION_BACKEND, GROQ_API_KEY, GROQ_MODEL,
     OLLAMA_MODEL, OLLAMA_BASE_URL,
     MEMORY_RECENT_SESSIONS, MEMORY_MAX_FACTS,
     MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE, MEMORY_COMPACTION,
+    MEMORY_MAX_PROFILE, MEMORY_PROFILE_DECAY_BASE,
+    MEMORY_SEMANTIC_RECALL, MEMORY_RECALL_K, MEMORY_RECALL_MIN_SIM,
 )
+from core.embeddings import Embedder
 
-# Profile shape. Lists of short strings, distilled over time. Kept deliberately
-# simple and additive so the consolidation model can return the whole thing back.
+# Profile shape. Seven categories, each a list of entries distilled over time. On
+# disk each entry is a small object {text, salience, last_seen} so the profile can be
+# injection-capped and decayed exactly like the episodic layer (see _render_profile);
+# legacy profiles stored as bare strings are upgraded transparently on load. The LLM
+# passes only ever see/return the plain text — we re-attach salience/recency ourselves.
 _EMPTY_PROFILE = {
     "identity": [],            # who they are: name, role, where they live, etc.
     "preferences": [],         # how they like TARS to behave / answer
@@ -46,6 +54,14 @@ _EMPTY_PROFILE = {
     "annoyances": [],          # things that genuinely wind them up
     "recurring_requests": [],  # stuff they keep asking TARS to do
     "relationship_notes": [],  # the texture of the bond, inside jokes, tone
+}
+
+# Default salience a freshly-distilled entry gets, per category. Identity is near-
+# certain to matter (and is pinned in rendering anyway); a passing "like" matters less.
+# These only seed NEW entries — recency (last_seen) + decay do the rest over time.
+_PROFILE_DEFAULT_SALIENCE = {
+    "identity": 0.95, "preferences": 0.7, "likes": 0.6, "dislikes": 0.65,
+    "annoyances": 0.7, "recurring_requests": 0.6, "relationship_notes": 0.65,
 }
 
 _KIND_LABELS = {
@@ -67,6 +83,37 @@ def _fmt_when(iso: str) -> str:
         return datetime.fromisoformat(iso).strftime("%a %d %b, %H:%M")
     except (ValueError, TypeError):
         return iso
+
+
+def _coerce_entry(x, default_salience: float, current_seq: int) -> dict | None:
+    """Normalize one profile entry into the on-disk object shape. Accepts both the
+    new {text, salience, last_seen} form and a legacy bare string (upgraded with the
+    category default and the current session as its recency). Returns None for empties
+    so callers can drop them. Salience is clamped to [0, 1]."""
+    if isinstance(x, dict):
+        text = str(x.get("text", "")).strip()
+        if not text:
+            return None
+        try:
+            salience = float(x.get("salience", default_salience))
+        except (TypeError, ValueError):
+            salience = default_salience
+        try:
+            last_seen = int(x.get("last_seen", current_seq))
+        except (TypeError, ValueError):
+            last_seen = current_seq
+    else:
+        text = str(x).strip()
+        if not text:
+            return None
+        salience, last_seen = default_salience, current_seq
+    return {"text": text, "salience": min(1.0, max(0.0, salience)), "last_seen": last_seen}
+
+
+def _profile_texts(profile: dict) -> dict:
+    """The profile reduced to plain string lists — what the LLM passes see. They never
+    deal with salience/recency; we re-attach that ourselves when applying their output."""
+    return {k: [e["text"] for e in (profile.get(k) or [])] for k in _EMPTY_PROFILE}
 
 
 class MemoryStore:
@@ -112,8 +159,17 @@ class MemoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
                 CREATE INDEX IF NOT EXISTS idx_mem_session  ON memories(session_id);
+                CREATE TABLE IF NOT EXISTS profile_vectors (
+                    text      TEXT PRIMARY KEY,
+                    embedding BLOB NOT NULL
+                );
                 """
             )
+            # Migration: episodic memories gained a vector for semantic recall. Older
+            # DBs predate the column — add it (backfilled lazily by ensure_embeddings).
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(memories)")}
+            if "embedding" not in cols:
+                self._conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
             self._conn.commit()
 
     # -- session lifecycle ----------------------------------------------------
@@ -158,9 +214,10 @@ class MemoryStore:
             self._conn.commit()
 
     # -- context injection (read-side) ---------------------------------------
-    def _effective_salience(self, salience: float, last_seq: int, current_seq: int) -> float:
+    def _effective_salience(self, salience: float, last_seq: int, current_seq: int,
+                            base: float = MEMORY_DECAY_BASE) -> float:
         elapsed = max(0, current_seq - last_seq)
-        return salience * (MEMORY_DECAY_BASE ** elapsed)
+        return salience * (base ** elapsed)
 
     def build_context_block(self) -> str:
         """Assemble the memory the system prompt is augmented with at session start:
@@ -211,7 +268,7 @@ class MemoryStore:
             f"across {prior_count} earlier session(s). You actually remember them.",
         ]
 
-        prof_lines = self._render_profile(profile)
+        prof_lines, injected_profile = self._render_profile(profile, current_seq)
         if prof_lines:
             lines.append(f"\nWhat you know about {USER_NAME}:")
             lines.extend(prof_lines)
@@ -247,49 +304,196 @@ class MemoryStore:
                 )
                 self._conn.commit()
 
+        # Same reinforcement for the profile: entries we actually injected this session
+        # get their recency refreshed so they don't drift toward fading. Persist it
+        # without rotating the .prev backup — that's reserved as insurance against a bad
+        # consolidation pass, not a routine recency touch.
+        if injected_profile:
+            for e in injected_profile:
+                e["last_seen"] = current_seq
+            self._save_profile(profile, backup=False)
+
+        return "\n".join(lines)
+
+    # -- semantic recall (associative, query-driven) -------------------------
+    def ensure_embeddings(self) -> None:
+        """Make every memory recall-ready: embed episodic rows that lack a vector and
+        the current profile entries, pruning vectors for profile text that no longer
+        exists (merged/edited away). One-time-ish cost, meant to run at startup OFF the
+        conversation path. Entirely best-effort — if the embedder can't load, it no-ops
+        and recall stays disabled, TARS just runs on salience memory."""
+        if not MEMORY_SEMANTIC_RECALL:
+            return
+        emb = Embedder.get()
+
+        with self._lock:
+            missing = self._conn.execute(
+                "SELECT id, content FROM memories WHERE embedding IS NULL"
+            ).fetchall()
+        if missing:
+            vecs = emb.encode([r["content"] for r in missing])
+            if vecs is not None:
+                with self._lock:
+                    self._conn.executemany(
+                        "UPDATE memories SET embedding = ? WHERE id = ?",
+                        [(vecs[i].tobytes(), missing[i]["id"]) for i in range(len(missing))],
+                    )
+                    self._conn.commit()
+
+        profile = self.load_profile()
+        texts = []
+        for k in _EMPTY_PROFILE:
+            texts.extend(e["text"] for e in (profile.get(k) or []))
+        texts = list(dict.fromkeys(texts))  # de-dupe, keep order
+        with self._lock:
+            have = {r["text"] for r in
+                    self._conn.execute("SELECT text FROM profile_vectors").fetchall()}
+        new = [t for t in texts if t not in have]
+        if new:
+            vecs = emb.encode(new)
+            if vecs is not None:
+                with self._lock:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO profile_vectors (text, embedding) VALUES (?, ?)",
+                        [(new[i], vecs[i].tobytes()) for i in range(len(new))],
+                    )
+                    self._conn.commit()
+        stale = [t for t in have if t not in set(texts)]
+        if stale:
+            with self._lock:
+                self._conn.executemany(
+                    "DELETE FROM profile_vectors WHERE text = ?", [(t,) for t in stale])
+                self._conn.commit()
+
+    def recall_relevant(self, query: str, k: int = MEMORY_RECALL_K) -> str:
+        """The associative half of memory: given what the user just said, pull up the
+        few stored memories (episodic + profile) most semantically similar to it, above
+        a cosine floor. Surfacing a memory reinforces it (recall_count++, decay clock
+        reset) — thinking about something makes it salient again, like a real mind.
+        Returns a short context block to fold into THIS turn only, or '' if nothing
+        clears the bar / recall is off. Cheap enough for the hot path (one short embed
+        + a dot product over a few hundred vectors)."""
+        if not MEMORY_SEMANTIC_RECALL or not (query or "").strip():
+            return ""
+        qv = Embedder.get().encode_one(query)
+        if qv is None:
+            return ""
+
+        with self._lock:
+            mem_rows = self._conn.execute(
+                "SELECT id, kind, content, embedding FROM memories "
+                "WHERE embedding IS NOT NULL"
+            ).fetchall()
+            prof_rows = self._conn.execute(
+                "SELECT text, embedding FROM profile_vectors").fetchall()
+
+        scored = []  # (sim, source, mem_id, kind, text)
+        for r in mem_rows:
+            v = np.frombuffer(r["embedding"], dtype=np.float32)
+            scored.append((float(qv @ v), "mem", r["id"], r["kind"], r["content"]))
+        for r in prof_rows:
+            v = np.frombuffer(r["embedding"], dtype=np.float32)
+            scored.append((float(qv @ v), "prof", None, "identity", r["text"]))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked = [s for s in scored if s[0] >= MEMORY_RECALL_MIN_SIM][:max(1, k)]
+        if not picked:
+            return ""
+
+        # Reinforce the episodic memories we just associatively recalled.
+        mem_ids = [s[2] for s in picked if s[1] == "mem"]
+        if mem_ids:
+            seq = self.session_id or 0
+            with self._lock:
+                self._conn.executemany(
+                    "UPDATE memories SET last_seq = ?, recall_count = recall_count + 1 "
+                    "WHERE id = ?", [(seq, i) for i in mem_ids])
+                self._conn.commit()
+
+        lines = ["(What they just said stirs these specific memories — only bring one up "
+                 "if it actually fits, and never announce that you're 'recalling' anything:)"]
+        for _sim, source, _id, kind, text in picked:
+            label = _KIND_LABELS.get(kind, "note") if source == "mem" else "about them"
+            lines.append(f"- ({label}) {text}")
         return "\n".join(lines)
 
     @staticmethod
     def _profile_is_empty(profile: dict) -> bool:
         return not any(profile.get(k) for k in _EMPTY_PROFILE)
 
-    @staticmethod
-    def _render_profile(profile: dict) -> list[str]:
+    def _render_profile(self, profile: dict, current_seq: int) -> tuple[list[str], list[dict]]:
+        """Render the profile for prompt injection, but CAPPED so it can't flood the
+        prompt as it grows. "identity" is always shown (foundational, tiny). The other
+        six categories compete for MEMORY_MAX_PROFILE slots ranked by decayed salience;
+        entries below the salience floor are dropped from this injection (not deleted —
+        they stay on disk and can resurface later). Returns the rendered lines plus the
+        list of entry objects actually injected, so the caller can refresh their recency."""
         headers = {
             "identity": "Who they are", "preferences": "How they like you to be",
             "likes": "Likes", "dislikes": "Dislikes",
             "annoyances": "Winds them up", "recurring_requests": "Often asks you to",
             "relationship_notes": "Between you two",
         }
+        selected = {k: [] for k in headers}
+        injected: list[dict] = []
+
+        # identity: pinned, never subject to the cap or decay.
+        for e in profile.get("identity") or []:
+            selected["identity"].append(e)
+            injected.append(e)
+
+        # everything else: rank by decayed salience, keep the strongest up to the cap.
+        pool = []
+        for key in headers:
+            if key == "identity":
+                continue
+            for e in profile.get(key) or []:
+                eff = self._effective_salience(
+                    e["salience"], e["last_seen"], current_seq, MEMORY_PROFILE_DECAY_BASE)
+                if eff >= MEMORY_MIN_SALIENCE:
+                    pool.append((eff, key, e))
+        pool.sort(key=lambda x: x[0], reverse=True)
+        for _eff, key, e in pool[:MEMORY_MAX_PROFILE]:
+            selected[key].append(e)
+            injected.append(e)
+
         out = []
         for key, header in headers.items():
-            items = profile.get(key) or []
+            items = [e["text"] for e in selected[key] if e["text"].strip()]
             if items:
                 out.append(f"- {header}: " + "; ".join(items))
-        return out
+        return out, injected
 
     # -- profile JSON ---------------------------------------------------------
     def load_profile(self) -> dict:
+        """Load the profile as {category: [ {text, salience, last_seen}, ... ]}. Legacy
+        files with bare-string entries are upgraded in memory (and persisted on the next
+        save). Only known keys are kept; empties are dropped."""
         try:
             with open(self.profile_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            return {k: list(v) for k, v in _EMPTY_PROFILE.items()}
-        # Normalize: keep only known keys, ensure they're lists of strings.
-        return {
-            k: [str(x) for x in (data.get(k) or []) if str(x).strip()]
-            for k in _EMPTY_PROFILE
-        }
+            return {k: [] for k in _EMPTY_PROFILE}
+        seq = self.session_id or 0
+        out = {}
+        for k in _EMPTY_PROFILE:
+            default = _PROFILE_DEFAULT_SALIENCE.get(k, 0.6)
+            entries = [_coerce_entry(x, default, seq) for x in (data.get(k) or [])]
+            out[k] = [e for e in entries if e]
+        return out
 
-    def _save_profile(self, profile: dict) -> None:
-        clean = {
-            k: [str(x) for x in (profile.get(k) or []) if str(x).strip()]
-            for k in _EMPTY_PROFILE
-        }
+    def _save_profile(self, profile: dict, backup: bool = True) -> None:
+        seq = self.session_id or 0
+        clean = {}
+        for k in _EMPTY_PROFILE:
+            default = _PROFILE_DEFAULT_SALIENCE.get(k, 0.6)
+            entries = [_coerce_entry(x, default, seq) for x in (profile.get(k) or [])]
+            clean[k] = [e for e in entries if e]
         clean["updated_at"] = _now()
         # Keep one backup before overwriting — cheap insurance against a bad
-        # consolidation pass silently dropping things the user told us.
-        if os.path.exists(self.profile_path):
+        # consolidation pass silently dropping things the user told us. Routine recency
+        # touches (build_context_block) pass backup=False so they don't burn the .prev.
+        if backup and os.path.exists(self.profile_path):
             try:
                 os.replace(self.profile_path, self.profile_path + ".prev")
             except OSError:
@@ -384,17 +588,13 @@ class MemoryStore:
         for content, kind, salience in norm_facts:
             print(f"[MEMORY]     - [{kind} {salience:.2f}] {content}")
 
-        # Profile is rewritten wholesale by the model (told to preserve unless
-        # contradicted). Only accept it if it looks like our shape; the .prev
-        # backup in _save_profile covers a bad pass. Log what newly landed.
+        # Profile is rewritten wholesale by the model as plain strings (told to preserve
+        # unless contradicted). Re-attach our metadata: entries that already existed keep
+        # their salience/recency, genuinely new ones get the category default stamped with
+        # this session as their recency. The .prev backup in _save_profile covers a bad pass.
         if isinstance(new_profile, dict):
-            added = []
-            for k in _EMPTY_PROFILE:
-                before = set(profile.get(k) or [])
-                for x in (new_profile.get(k) or []):
-                    if str(x).strip() and str(x) not in before:
-                        added.append(f"{k}: {x}")
-            self._save_profile(new_profile)
+            merged, added = self._merge_returned_profile(profile, new_profile, session_id)
+            self._save_profile(merged)
             if added:
                 print(f"[MEMORY]   profile gained {len(added)} new entry(ies):")
                 for a in added:
@@ -413,6 +613,53 @@ class MemoryStore:
             )
             self._conn.commit()
 
+    @staticmethod
+    def _merge_returned_profile(old: dict, returned: dict, current_seq: int) -> tuple[dict, list[str]]:
+        """Fold the model's plain-string profile back into our object-profile, preserving
+        per-entry salience/recency. An entry whose text already exists keeps its object
+        (and thus its accumulated salience/recency); a genuinely new one gets the category
+        default salience and this session as its recency. Entries the model dropped are
+        intentionally dropped (it was told to preserve unless contradicted). Returns the
+        merged object-profile plus a list of newly-added "category: text" strings to log.
+
+        Note: a lightly-reworded existing entry won't text-match, so it's treated as new
+        and resets to default salience/fresh recency — an acceptable bias toward freshness."""
+        merged, added = {}, []
+        for k in _EMPTY_PROFILE:
+            existing = {e["text"]: e for e in (old.get(k) or [])}
+            default = _PROFILE_DEFAULT_SALIENCE.get(k, 0.6)
+            out, seen = [], set()
+            for x in (returned.get(k) or []):
+                text = str(x).strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                if text in existing:
+                    out.append(existing[text])
+                else:
+                    out.append({"text": text, "salience": default, "last_seen": current_seq})
+                    added.append(f"{k}: {text}")
+            merged[k] = out
+        return merged, added
+
+    @staticmethod
+    def _best_overlap(text: str, entries: list[dict]) -> dict | None:
+        """Find the existing entry most word-overlapping with `text` (Jaccard over the
+        word sets), or None if nothing meaningfully overlaps. Used to carry metadata onto
+        a merged/reworded entry so compaction doesn't silently downgrade an important trait."""
+        words = set(text.lower().split())
+        if not words:
+            return None
+        best, best_score = None, 0.0
+        for e in entries:
+            ew = set(e["text"].lower().split())
+            if not ew:
+                continue
+            score = len(words & ew) / len(words | ew)
+            if score > best_score:
+                best, best_score = e, score
+        return best if best_score >= 0.3 else None
+
     # -- compaction (write-side, LLM) ----------------------------------------
     def compact_profile(self) -> int:
         """Merge near-duplicate profile entries into single sharper phrases via one
@@ -425,9 +672,29 @@ class MemoryStore:
         merged = _compact_profile_llm(profile)
         if not isinstance(merged, dict):
             return 0
-        # Accept only something shaped like our profile that didn't wipe everything.
-        clean = {k: [str(x).strip() for x in (merged.get(k) or []) if str(x).strip()]
-                 for k in _EMPTY_PROFILE}
+        # The model returns plain strings; re-attach metadata. An unchanged entry keeps
+        # its object; a merged/reworded one inherits the metadata of its closest source
+        # (so an important trait isn't silently downgraded) and is treated as freshly
+        # touched. Accept only a non-empty, profile-shaped result.
+        seq = self.session_id or 0
+        clean = {}
+        for k in _EMPTY_PROFILE:
+            old_entries = profile.get(k) or []
+            by_text = {e["text"]: e for e in old_entries}
+            default = _PROFILE_DEFAULT_SALIENCE.get(k, 0.6)
+            out, seen = [], set()
+            for x in (merged.get(k) or []):
+                text = str(x).strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                if text in by_text:
+                    out.append(by_text[text])
+                else:
+                    src = self._best_overlap(text, old_entries)
+                    salience = max(src["salience"], default) if src else default
+                    out.append({"text": text, "salience": salience, "last_seen": seq})
+            clean[k] = out
         after = sum(len(clean[k]) for k in _EMPTY_PROFILE)
         if after == 0:
             print("[MEMORY] profile compaction returned empty — keeping current profile")
@@ -479,9 +746,11 @@ class MemoryStore:
                 kind = str(grp.get("kind", keep["kind"])).strip().lower()
                 if kind not in _KIND_LABELS:
                     kind = keep["kind"]
+                # NULL the embedding so the merged phrasing gets re-vectorized next
+                # startup — the old vector was for the pre-merge content.
                 self._conn.execute(
                     "UPDATE memories SET content=?, kind=?, salience=?, recall_count=?, "
-                    "last_seq=? WHERE id=?",
+                    "last_seq=?, embedding=NULL WHERE id=?",
                     (content, kind, max(r["salience"] for r in grp_rows),
                      sum(r["recall_count"] for r in grp_rows),
                      max(r["last_seq"] for r in grp_rows), keep["id"]),
@@ -566,8 +835,7 @@ def _consolidation_llm(transcript: str, current_profile: dict) -> dict:
     system = _CONSOLIDATION_SYSTEM.format(user=USER_NAME)
     user = (
         "CURRENT PROFILE:\n"
-        + json.dumps({k: current_profile.get(k, []) for k in _EMPTY_PROFILE},
-                     ensure_ascii=False, indent=2)
+        + json.dumps(_profile_texts(current_profile), ensure_ascii=False, indent=2)
         + "\n\nSESSION TRANSCRIPT:\n" + transcript
     )
     return _chat_json(system, user)
@@ -601,7 +869,7 @@ between categories unless one is plainly in the wrong list.
 def _compact_profile_llm(profile: dict) -> dict:
     system = _PROFILE_COMPACT_SYSTEM.format(user=USER_NAME)
     user = "CURRENT PROFILE:\n" + json.dumps(
-        {k: profile.get(k, []) for k in _EMPTY_PROFILE}, ensure_ascii=False, indent=2)
+        _profile_texts(profile), ensure_ascii=False, indent=2)
     return _chat_json(system, user)
 
 

@@ -57,12 +57,21 @@ class TARSBrain:
         for chunk in stream:
             yield chunk["message"]["content"]
 
-    def chat_stream(self, message: str) -> Iterator[str]:
+    def chat_stream(self, message: str, recalled: str = "") -> Iterator[str]:
         self.history.append({"role": "user", "content": message})
+        # Associative recall is per-turn and topic-specific, so it's injected as an
+        # ephemeral system note right before this user message — only into THIS API
+        # call, never stored in history. That keeps the conversation log clean and lets
+        # the recalled set follow the topic instead of piling up across turns.
+        if recalled.strip():
+            messages = self.history[:-1] + [
+                {"role": "system", "content": recalled}, self.history[-1]]
+        else:
+            messages = self.history
         full_text: list[str] = []
         stream = self._stream_groq if self.backend == "groq" else self._stream_ollama
         try:
-            for delta in stream(self.history):
+            for delta in stream(messages):
                 full_text.append(delta)
                 yield delta
         finally:

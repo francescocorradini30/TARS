@@ -65,6 +65,29 @@ MEMORY_MAX_FACTS = int(os.getenv("MEMORY_MAX_FACTS", "14"))             # top ep
 MEMORY_DECAY_BASE = float(os.getenv("MEMORY_DECAY_BASE", "0.8"))
 MEMORY_MIN_SALIENCE = float(os.getenv("MEMORY_MIN_SALIENCE", "0.15"))
 
+# Profile injection cap. The profile is the one memory layer that doesn't self-prune,
+# so injecting it whole floods the prompt and dilutes TARS's persona as it grows. We
+# give each profile entry the same salience+decay the episodic layer has — but gentler
+# (a core trait should outlast a one-off event) — and inject only the strongest few.
+# "identity" entries are ALWAYS injected (foundational, small) and don't count toward
+# the cap; the other six categories compete for MEMORY_MAX_PROFILE slots by decayed
+# salience. Nothing is deleted: a faded entry just stops being injected and can resurface
+# later if it regains relevance. Default 14 ≈ today's profile size, so nothing is cut now.
+MEMORY_MAX_PROFILE = int(os.getenv("MEMORY_MAX_PROFILE", "14"))
+MEMORY_PROFILE_DECAY_BASE = float(os.getenv("MEMORY_PROFILE_DECAY_BASE", "0.92"))
+
+# Semantic recall. Salience+decay decides what TARS walks in remembering; this adds the
+# *associative* half — every turn, the user's words are embedded and the most relevant
+# stored memories (episodic + profile) are pulled up on demand, the way a human recalls
+# something a topic reminds them of even if it had faded. Embeddings run locally on CPU
+# (see core/embeddings.py); if the model can't load, recall silently disables and TARS
+# falls back to salience-only memory. RECALL_K = how many to surface, MIN_SIM = the
+# cosine floor below which a memory isn't "reminded" (avoids dragging in loose matches).
+MEMORY_SEMANTIC_RECALL = os.getenv("MEMORY_SEMANTIC_RECALL", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+MEMORY_RECALL_K = int(os.getenv("MEMORY_RECALL_K", "5"))
+MEMORY_RECALL_MIN_SIM = float(os.getenv("MEMORY_RECALL_MIN_SIM", "0.35"))
+
 # Compaction. After each session is consolidated, an extra LLM pass merges
 # near-duplicate profile entries into one sharper phrase, and a second pass
 # de-duplicates redundant episodic-memory rows. Keeps the persistent store tight

@@ -46,7 +46,8 @@ for _dll_path in [
 import webview
 import core.stt as stt
 import core.tts as tts
-from config import LLM_BACKEND
+from config import LLM_BACKEND, MEMORY_SEMANTIC_RECALL
+from core.embeddings import Embedder
 from core.llm import TARSBrain
 from core.log import Request, fmt_dur
 from core.memory import MemoryStore
@@ -184,12 +185,19 @@ def _run_pipeline(req: Request, text: str) -> None:
         drain_thread = threading.Thread(target=drain, daemon=True)
         drain_thread.start()
 
+        # Associative recall: pull up memories semantically related to what they just
+        # said, to fold into this turn only. Best-effort + off the critical path latency-
+        # wise (one short CPU embed + a dot product); empty string if recall is off.
+        with req.phase("memory-recall") as rec_phase:
+            recalled = memory.recall_relevant(text)
+            rec_phase.note("hit" if recalled else "none")
+
         first_chunk_pending = True
         try:
             with req.phase("llm-stream") as llm_phase:
                 ttft_start = time.perf_counter()
                 ttft_logged = False
-                for chunk in brain.chat_stream(text):
+                for chunk in brain.chat_stream(text, recalled=recalled):
                     if not ttft_logged:
                         req.event("llm-ttft", fmt_dur(time.perf_counter() - ttft_start))
                         ttft_logged = True
@@ -285,6 +293,10 @@ if __name__ == "__main__":
     # Kokoro warmup in background — the model may need downloading (~350MB)
     # on first run; we don't want to block window startup behind that.
     threading.Thread(target=tts.warmup, daemon=True).start()
+    # Embedder warmup (semantic recall) in background too — small CPU model, may need a
+    # one-time ~23MB download. Off the main thread so it never delays the window.
+    if MEMORY_SEMANTIC_RECALL:
+        threading.Thread(target=Embedder.get().warmup, daemon=True).start()
 
     # Persistent memory. First mop up any session a previous crash left
     # un-distilled (the raw turns are safe in the journal), then open this
@@ -308,6 +320,10 @@ if __name__ == "__main__":
         print("[MEMORY] ----- end injected context -----")
     except Exception as e:
         print(f"[MEMORY] context build failed: {type(e).__name__}: {e}")
+    # Make stored memories recall-ready: backfill any missing embeddings (episodic +
+    # profile) now, off the conversation path. Best-effort; a slow first-run download
+    # shouldn't hold up the UI, so do it in the background.
+    threading.Thread(target=memory.ensure_embeddings, daemon=True).start()
     ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
     _window = webview.create_window(
         title="TARS",
