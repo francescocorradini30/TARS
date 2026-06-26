@@ -28,6 +28,22 @@ function setStatus(key) {
     document.getElementById('statusText').textContent = STATUS_LABELS[key] ?? key.toUpperCase();
 }
 
+// ── Readout levels (called from Python via evaluate_js) ───────────────────────
+// The HUMOR bar is driven by the real config value, not hardcoded. Python pushes it
+// on load and can call setLevels() again whenever the value changes, so the readout
+// stays connected in real time (e.g. once self-modification can move the dial).
+const BAR_CELLS = 16;
+
+function renderBar(pct) {
+    const filled = Math.max(0, Math.min(BAR_CELLS, Math.round(pct / 100 * BAR_CELLS)));
+    return '█'.repeat(filled) + '░'.repeat(BAR_CELLS - filled);
+}
+
+function setLevels(humor) {
+    document.getElementById('humorBar').textContent = renderBar(humor);
+    document.getElementById('humorPct').textContent = `${Math.round(humor)}%`;
+}
+
 // ── Stream lifecycle (called from Python via evaluate_js) ─────────────────────
 function startTarsStream() {
     streamComplete = false;

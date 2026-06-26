@@ -46,7 +46,7 @@ for _dll_path in [
 import webview
 import core.stt as stt
 import core.tts as tts
-from config import LLM_BACKEND, MEMORY_SEMANTIC_RECALL
+from config import LLM_BACKEND, MEMORY_SEMANTIC_RECALL, TARS_HUMOR
 from core.embeddings import Embedder
 from core.llm import TARSBrain
 from core.log import Request, fmt_dur
@@ -262,6 +262,9 @@ def _on_window_loaded():
     stt.set_barge_in_callback(_request_interrupt)
     stt.start_listener(_on_utterance)
     _window.evaluate_js("setStatus('idle')")
+    # Drive the HUMOR readout from the real config value, not the hardcoded HTML.
+    # setLevels() can be re-called any time the dial changes.
+    _window.evaluate_js(f"setLevels({TARS_HUMOR})")
 
 
 class TARSAPI:
@@ -273,6 +276,11 @@ class TARSAPI:
 
     def reset(self) -> None:
         brain.reset()
+
+    def get_levels(self) -> dict:
+        """The real HUMOR value for the UI readout. The window-loaded hook already
+        pushes it via setLevels(); this lets the UI pull it too."""
+        return {"humor": TARS_HUMOR}
 
     def set_power(self, on: bool) -> dict:
         """Power TARS's ear on/off from the UI switch. Off stops the listener loop,
