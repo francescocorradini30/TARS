@@ -35,7 +35,8 @@ from config import (
     CONSOLIDATION_BACKEND, GROQ_API_KEY, GROQ_MODEL,
     OLLAMA_MODEL, OLLAMA_BASE_URL,
     MEMORY_RECENT_SESSIONS, MEMORY_MAX_FACTS,
-    MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE, MEMORY_COMPACTION,
+    MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE, MEMORY_STORE_MIN_SALIENCE,
+    MEMORY_COMPACTION,
     MEMORY_MAX_PROFILE, MEMORY_PROFILE_DECAY_BASE,
     MEMORY_SEMANTIC_RECALL, MEMORY_RECALL_K, MEMORY_RECALL_MIN_SIM,
 )
@@ -558,7 +559,11 @@ class MemoryStore:
         new_profile = result.get("profile")
 
         # Normalize the extracted facts up front so we can both store AND log them.
+        # Anything the model rates below the storage floor is dropped here — the
+        # deterministic guard against trivia ("had a casual chat") leaking in even
+        # when the prompt fails to suppress it upstream.
         norm_facts = []
+        dropped = 0
         for fact in result.get("facts") or []:
             content = str(fact.get("content", "")).strip()
             if not content:
@@ -571,6 +576,9 @@ class MemoryStore:
             except (TypeError, ValueError):
                 salience = 0.5
             salience = min(1.0, max(0.0, salience))
+            if salience < MEMORY_STORE_MIN_SALIENCE:
+                dropped += 1
+                continue
             norm_facts.append((content, kind, salience))
 
         with self._lock:
@@ -584,7 +592,8 @@ class MemoryStore:
 
         # Log exactly what TARS took away from this session — the test signal.
         print(f"[MEMORY]   summary: {summary or '(none)'}")
-        print(f"[MEMORY]   {len(norm_facts)} fact(s) remembered:")
+        tail = f" ({dropped} trivial dropped)" if dropped else ""
+        print(f"[MEMORY]   {len(norm_facts)} fact(s) remembered{tail}:")
         for content, kind, salience in norm_facts:
             print(f"[MEMORY]     - [{kind} {salience:.2f}] {content}")
 
@@ -774,8 +783,14 @@ class MemoryStore:
 _CONSOLIDATION_SYSTEM = """You are the memory consolidation system for TARS, an AI \
 companion. You are given the transcript of one conversation session between TARS and \
 {user}, plus what TARS currently knows about {user}. Distill the session into durable \
-long-term memory. Be selective: capture what genuinely matters for knowing this person \
-and continuing the relationship — skip small talk and one-off trivia.
+long-term memory. Be RUTHLESSLY selective: record only concrete, durable things about \
+{user} — who they are, what they like or dislike, what they're working on, what they ask \
+of you, meaningful events in their life. \
+Do NOT record that a conversation happened, greetings, goodbyes, small talk, passing \
+moods, or meta-observations about the chat itself (e.g. "had a casual chat after a brief \
+absence", "exchanged a greeting", "the conversation was relaxed"). Those are noise. \
+For a short or purely social session the correct output is an EMPTY facts list — that is \
+common and expected, not a failure.
 
 Reply with ONLY a JSON object, no prose, in exactly this shape:
 {{
@@ -790,11 +805,13 @@ Reply with ONLY a JSON object, no prose, in exactly this shape:
 }}
 
 Rules:
-- salience: 0.9-1.0 = core to who they are / strong feelings; 0.5 = ordinary; 0.2 = minor.
+- salience: 0.9-1.0 = core to who they are / strong feelings; 0.5 = ordinary but real; \
+0.3 = minor-but-worth-it. Anything you'd score below 0.3 is trivia — leave it out entirely \
+rather than including it with a low score.
 - "profile" must be the FULL updated profile: start from the current profile given to \
 you and PRESERVE every existing entry unless this session clearly contradicts or updates \
 it. Add new durable traits. Keep each entry a short phrase. Don't duplicate.
-- Everything in English. If the session was trivial, it's fine to return few or no facts.
+- Everything in English. When in doubt about a fact, leave it out — an empty facts list is far better than storing noise.
 """
 
 

@@ -55,145 +55,54 @@ body::after {
     text-indent: 6px;
 }
 
-/* TARS body */
-.tars-body {
-    width: 100px;
-    height: 280px;
-    border: 1px solid var(--border);
+/* TARS sphere — the single visual. Off when idle, blue while it takes in your
+   speech, green while it answers. The two active states pulse in place (no drift),
+   breathing both their scale and their glow. */
+.tars-stage {
+    /* fixed height so the small sphere stays centred up top while the footer
+       controls stay pinned to the bottom via their own margin-top: auto */
+    height: 110px;
     display: flex;
-    flex-direction: column;
-    position: relative;
-    transition: border-color 0.4s, box-shadow 0.4s;
-    overflow: hidden;
-}
-
-.tars-body.dormant     { border-color: #0c0c18; }
-.tars-body.dormant .eye { background: #111126; box-shadow: none; }
-.tars-body.listening   { border-color: var(--green); box-shadow: 0 0 18px var(--green-glow); }
-.tars-body.transcribing{ border-color: var(--amber); box-shadow: 0 0 18px var(--amber-glow); }
-.tars-body.thinking    { border-color: var(--blue);  box-shadow: 0 0 18px var(--blue-glow); }
-.tars-body.speaking    { border-color: var(--amber); box-shadow: 0 0 18px var(--amber-glow); }
-
-/* Scan line for thinking and transcribing */
-.tars-body.thinking::after,
-.tars-body.transcribing::after {
-    content: '';
-    position: absolute;
-    left: 0; right: 0;
-    height: 2px;
-    background: linear-gradient(90deg, transparent, var(--blue), transparent);
-    animation: scan 1.6s ease-in-out infinite;
-}
-.tars-body.transcribing::after {
-    background: linear-gradient(90deg, transparent, var(--amber), transparent);
-}
-
-@keyframes scan {
-    0%   { top: -2px; opacity: 0; }
-    5%   { opacity: 1; }
-    95%  { opacity: 1; }
-    100% { top: 100%; opacity: 0; }
-}
-
-/* Panel segments (top / bottom) */
-.segment {
-    height: 52px;
-    background: var(--border);
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 6px;
-    padding: 0 10px;
-}
-
-.panel-line {
-    height: 1px;
-    background: var(--muted);
-    opacity: 0.4;
-}
-
-.panel-line.short { width: 50%; }
-
-/* Core: waveform + eye */
-.core {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 14px;
-    padding: 12px 8px;
+    width: 100%;
 }
 
-/* Waveform bars */
-.waveform {
-    display: flex;
-    align-items: flex-end;
-    gap: 3px;
+.sphere {
+    width: 56px;
     height: 56px;
-}
-
-.bar {
-    width: 5px;
-    min-height: 3px;
-    height: 3px;
-    border-radius: 2px 2px 0 0;
-    background: var(--muted);
-    transition: background 0.3s;
-}
-
-/* Per-state bar animations */
-.tars-body.listening .bar {
-    background: var(--green);
-    animation: bar-idle 2s ease-in-out infinite;
-}
-
-.tars-body.speaking .bar {
-    background: var(--amber);
-    animation: bar-speak 0.7s ease-in-out infinite;
-}
-
-@keyframes bar-idle {
-    0%, 100% { height: 3px; }
-    50%       { height: 18px; }
-}
-
-@keyframes bar-speak {
-    0%, 100% { height: 6px; }
-    50%       { height: 48px; }
-}
-
-/* Stagger delays */
-.bar:nth-child(1)  { animation-delay: 0.00s; }
-.bar:nth-child(2)  { animation-delay: 0.07s; }
-.bar:nth-child(3)  { animation-delay: 0.14s; }
-.bar:nth-child(4)  { animation-delay: 0.21s; }
-.bar:nth-child(5)  { animation-delay: 0.28s; }
-.bar:nth-child(6)  { animation-delay: 0.35s; }
-.bar:nth-child(7)  { animation-delay: 0.35s; }
-.bar:nth-child(8)  { animation-delay: 0.28s; }
-.bar:nth-child(9)  { animation-delay: 0.21s; }
-.bar:nth-child(10) { animation-delay: 0.14s; }
-.bar:nth-child(11) { animation-delay: 0.07s; }
-.bar:nth-child(12) { animation-delay: 0.00s; }
-
-/* Eye */
-.eye {
-    width: 12px;
-    height: 12px;
     border-radius: 50%;
-    background: var(--muted);
-    transition: background 0.3s, box-shadow 0.3s;
+    /* off-centre highlight gives the flat circle a lit-from-above 3D read */
+    background: radial-gradient(circle at 36% 30%, #24243200, #0a0a12 72%);
+    transition: background 0.5s ease, box-shadow 0.5s ease;
 }
 
-.tars-body.listening    .eye { background: var(--green); box-shadow: 0 0 8px var(--green); }
-.tars-body.transcribing .eye { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: blink 0.5s ease-in-out infinite; }
-.tars-body.thinking     .eye { background: var(--blue);  box-shadow: 0 0 8px var(--blue);  animation: blink 1s ease-in-out infinite; }
-.tars-body.speaking     .eye { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+/* Off / idle — dark, still, slightly sunken. */
+.sphere.off {
+    background: radial-gradient(circle at 36% 30%, #2a2a3a, #0a0a12 72%);
+    box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.65);
+}
 
-@keyframes blink {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.2; }
+/* Listening / processing your speech — blue, pulsing in place. */
+.sphere.listening {
+    background: radial-gradient(circle at 36% 30%, #bfdbfe, var(--blue) 52%, #1e3a8a 100%);
+    animation: pulse-blue 1.8s ease-in-out infinite;
+}
+
+/* Responding — luminous green, faster pulse. */
+.sphere.speaking {
+    background: radial-gradient(circle at 36% 30%, #d9fbe7, var(--green) 52%, #166534 100%);
+    animation: pulse-green 0.9s ease-in-out infinite;
+}
+
+@keyframes pulse-blue {
+    0%, 100% { transform: scale(1);    box-shadow: 0 0 12px var(--blue),  0 0 26px var(--blue-glow); }
+    50%      { transform: scale(1.08); box-shadow: 0 0 20px var(--blue),  0 0 40px var(--blue-glow); }
+}
+
+@keyframes pulse-green {
+    0%, 100% { transform: scale(1);    box-shadow: 0 0 14px var(--green), 0 0 30px var(--green-glow); }
+    50%      { transform: scale(1.10); box-shadow: 0 0 24px var(--green), 0 0 48px var(--green-glow); }
 }
 
 /* Status */

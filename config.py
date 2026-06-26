@@ -64,6 +64,14 @@ MEMORY_MAX_FACTS = int(os.getenv("MEMORY_MAX_FACTS", "14"))             # top ep
 MEMORY_DECAY_BASE = float(os.getenv("MEMORY_DECAY_BASE", "0.8"))
 MEMORY_MIN_SALIENCE = float(os.getenv("MEMORY_MIN_SALIENCE", "0.15"))
 
+# Storage floor for newly-distilled episodic facts. MEMORY_MIN_SALIENCE above is a
+# READ filter (what gets injected); this is a WRITE filter — a fact the consolidation
+# model rates below this never enters the store at all. Stops throwaway trivia like
+# "had a casual chat after a brief absence" (the model tends to stamp these ~0.2
+# "misc") from cluttering the memory. The prompt is told the same threshold so it
+# ideally drops them upstream; this is the deterministic backstop.
+MEMORY_STORE_MIN_SALIENCE = float(os.getenv("MEMORY_STORE_MIN_SALIENCE", "0.3"))
+
 # Profile injection cap. The profile is the one memory layer that doesn't self-prune,
 # so injecting it whole floods the prompt and dilutes TARS's persona as it grows. We
 # give each profile entry the same salience+decay the episodic layer has — but gentler

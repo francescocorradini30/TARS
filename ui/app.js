@@ -1,18 +1,7 @@
 // ── State ─────────────────────────────────────────────────────────────────────
-const BARS = 12;
 const audioQueue = [];
 let isPlayingQueue = false;
 let streamComplete = false;
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-function initBars() {
-    const wf = document.getElementById('waveform');
-    for (let i = 0; i < BARS; i++) {
-        const b = document.createElement('div');
-        b.className = 'bar';
-        wf.appendChild(b);
-    }
-}
 
 // ── Status ────────────────────────────────────────────────────────────────────
 const STATUS_LABELS = {
@@ -23,8 +12,18 @@ const STATUS_LABELS = {
     speaking:     'RESPONDING',
 };
 
+// The sphere has just three looks. Everything where TARS is taking in / working on
+// your speech reads as the blue "listening" pulse; only its own reply is green.
+const SPHERE_STATE = {
+    idle:         'off',
+    listening:    'listening',
+    transcribing: 'listening',
+    thinking:     'listening',
+    speaking:     'speaking',
+};
+
 function setStatus(key) {
-    document.getElementById('tarsBody').className = `tars-body ${key === 'idle' ? '' : key}`.trim();
+    document.getElementById('sphere').className = `sphere ${SPHERE_STATE[key] ?? 'off'}`;
     document.getElementById('statusText').textContent = STATUS_LABELS[key] ?? key.toUpperCase();
 }
 
@@ -120,7 +119,7 @@ function setPowerUI(on) {
     } else {
         // Killing the listener also means no audio should keep playing.
         interruptStream();
-        document.getElementById('tarsBody').className = 'tars-body dormant';
+        document.getElementById('sphere').className = 'sphere off';
         document.getElementById('statusText').textContent = 'OFFLINE';
     }
 }
@@ -133,7 +132,6 @@ async function togglePower() {
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-    initBars();
     document.getElementById('resetBtn').addEventListener('click', resetConversation);
     document.getElementById('powerSwitch').addEventListener('click', togglePower);
 });

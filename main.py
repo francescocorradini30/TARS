@@ -341,10 +341,10 @@ if __name__ == "__main__":
         title="TARS",
         url=ui_path,
         js_api=TARSAPI(),
-        width=300,
-        height=560,
+        width=320,
+        height=340,
         resizable=True,
-        min_size=(260, 480),
+        min_size=(280, 300),
         background_color="#060608",
     )
     _window.events.loaded += _on_window_loaded
