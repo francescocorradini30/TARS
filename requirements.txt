@@ -4,6 +4,11 @@ sounddevice
 numpy
 ollama
 groq
+# Cloud LLM failover chain (core/llm.py): Groq, Cerebras and Gemini are all reached
+# through their OpenAI-compatible endpoints with this one SDK, so streaming + error
+# handling are uniform across providers. Groq's own SDK is still used by the memory
+# consolidation pass (core/memory.py).
+openai
 python-dotenv
 kokoro-onnx
 soundfile

@@ -13,6 +13,17 @@ import urllib.request
 import wave
 from concurrent.futures import ThreadPoolExecutor
 
+# Make every console print encoding-proof. The LLM responses we log can contain
+# characters outside the Windows console's default code page (cp1252) — e.g.
+# gpt-oss emits non-breaking hyphens / em-dashes — and a bare print() of those
+# raises UnicodeEncodeError, which would crash the pipeline thread mid-turn. UTF-8
+# with errors="replace" prints them (or a placeholder) instead of throwing.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # Make the pip-installed CUDA 12 libraries discoverable so BOTH ctranslate2
 # (faster-whisper) and onnxruntime-gpu (Kokoro TTS) find their dependencies.
 # Three mechanisms are needed together — each provider resolves DLLs differently:
@@ -46,7 +57,7 @@ for _dll_path in [
 import webview
 import core.stt as stt
 import core.tts as tts
-from config import LLM_BACKEND, MEMORY_SEMANTIC_RECALL
+from config import MEMORY_SEMANTIC_RECALL, LLM_REPROBE_IDLE_SECONDS
 from core.embeddings import Embedder
 from core.llm import TARSBrain
 from core.log import Request, fmt_dur
@@ -65,6 +76,35 @@ _pipeline_lock = threading.Lock()
 # an older, still-draining response (the bug that made two answers overlap).
 _cancel_lock = threading.Lock()
 _current_cancel: threading.Event | None = None
+
+# Idle re-probe of the LLM chain. After a stretch of silence we re-check any
+# higher-priority provider whose cooldown has elapsed, so the next utterance already
+# routes to the best available brain instead of eating a failed call. _reprobed is set
+# once per idle stretch (so we probe once, not in a loop) and cleared on every turn.
+_last_activity = time.monotonic()
+_reprobed = False
+
+
+def _note_activity() -> None:
+    global _last_activity, _reprobed
+    _last_activity = time.monotonic()
+    _reprobed = False
+
+
+def _idle_reprobe_loop() -> None:
+    """Daemon: during silence, pre-confirm recovered providers off the hot path."""
+    global _reprobed
+    while True:
+        time.sleep(3.0)
+        if stt.pipeline_active or _reprobed:
+            continue
+        if time.monotonic() - _last_activity < LLM_REPROBE_IDLE_SECONDS:
+            continue
+        try:
+            brain.reprobe_idle()
+        except Exception as e:
+            print(f"[LLM] idle reprobe error: {type(e).__name__}: {e}")
+        _reprobed = True
 
 
 def _timed_synthesize(text: str) -> tuple[bytes | None, float, str]:
@@ -144,6 +184,7 @@ def _run_pipeline(req: Request, text: str) -> None:
         with _cancel_lock:
             _current_cancel = cancel
         stt.pipeline_active = True
+        _note_activity()  # a turn started — defer any idle re-probe
         # Journal the user turn the moment we start answering it. If the app dies
         # mid-response this line is already on disk, so the session is recoverable.
         memory.log_turn("user", text)
@@ -197,7 +238,7 @@ def _run_pipeline(req: Request, text: str) -> None:
             with req.phase("llm-stream") as llm_phase:
                 ttft_start = time.perf_counter()
                 ttft_logged = False
-                for chunk in brain.chat_stream(text, recalled=recalled):
+                for chunk in brain.chat_stream(text, recalled=recalled, log=req.event):
                     if not ttft_logged:
                         req.event("llm-ttft", fmt_dur(time.perf_counter() - ttft_start))
                         ttft_logged = True
@@ -250,6 +291,7 @@ def _run_pipeline(req: Request, text: str) -> None:
             # real thing that happened, and consolidation should see it.
             memory.log_turn("assistant", response)
     finally:
+        _note_activity()  # turn done — start the idle clock from here
         _pipeline_lock.release()
 
 
@@ -288,20 +330,30 @@ class TARSAPI:
 
 
 if __name__ == "__main__":
-    # Cloud backend (groq) needs neither a local Ollama server nor a GPU warmup —
-    # the LLM lives off-machine, which is exactly what frees the VRAM.
-    if LLM_BACKEND == "ollama":
+    # GPU warmup only when ollama LEADS the chain: load the llama runner into GPU
+    # BEFORE Whisper takes the CUDA context (reverse order triggers "shared object
+    # initialization failed" on the runner). When a cloud provider leads we skip the
+    # warmup to keep the VRAM free — that's the whole point of the cloud path.
+    if brain.primary_is_ollama:
         ensure_ollama()
-        # Load llama runner into GPU BEFORE Whisper takes the CUDA context.
-        # Reverse order triggers "shared object initialization failed" on the
-        # llama runner because Whisper holds the GPU first.
         print("[OLLAMA] warming up llama runner on GPU...")
         try:
             brain.warmup()
         except Exception as e:
             print(f"[OLLAMA-WARMUP] {type(e).__name__}: {e}")
+    elif brain.uses_ollama:
+        # Cloud leads but ollama is the offline last-resort: bring the local server up
+        # (cheap — no GPU/VRAM until a model is actually loaded) so a fallback to it
+        # mid-session doesn't also pay a cold server start. Best-effort.
+        print("[LLM] cloud-led chain; starting Ollama as offline fallback (no warmup)")
+        try:
+            ensure_ollama()
+        except Exception as e:
+            print(f"[OLLAMA] fallback server not available: {type(e).__name__}: {e}")
     else:
-        print(f"[LLM] backend={LLM_BACKEND} (cloud) — skipping Ollama + GPU warmup")
+        print("[LLM] cloud-only chain — skipping Ollama + GPU warmup")
+    # Idle re-probe of the LLM chain runs for the whole process lifetime.
+    threading.Thread(target=_idle_reprobe_loop, daemon=True).start()
     # Kokoro warmup in background — the model may need downloading (~350MB)
     # on first run; we don't want to block window startup behind that.
     threading.Thread(target=tts.warmup, daemon=True).start()

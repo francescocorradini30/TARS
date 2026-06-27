@@ -9,9 +9,47 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b").split("=")[-1].strip()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # LLM backend: "ollama" (locale, GPU) o "groq" (cloud, gratis, libera la VRAM).
+# NB: superseded by LLM_CHAIN below — kept only for backward-compat / docs. The
+# conversation brain now runs a failover CHAIN, not a single backend.
 LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").strip().lower()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+
+# --- Multi-provider LLM failover chain ---------------------------------------
+# TARS's "brain" falls back across several backends so one provider's rate limit
+# (or outage) never takes him down. Personality + memory live in the system prompt
+# and the memory store — IDENTICAL across providers; only the reasoning model
+# changes. The chain is tried top-to-bottom; a rate-limited/erroring provider is
+# skipped by a circuit-breaker and auto-promoted back once it recovers. The
+# breaker uses an ABSOLUTE wall-clock cooldown (persisted), so closing/reopening
+# TARS — or the laptop sleeping — correctly sees that real time has passed and a
+# daily/minute limit has reset, instead of counting down a dead process timer.
+# Groq + Cerebras both run llama-3.3-70b (same weights; Cerebras is faster);
+# Gemini Flash is a strong different model; Ollama is the local last-resort that
+# keeps TARS alive fully offline (smaller/weaker — "dumber" — but still TARS).
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "").strip()
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+
+# Priority order, comma-separated. Cloud providers without an API key are dropped
+# at startup; "ollama" stays as the offline floor. Override to taste, e.g.
+# LLM_CHAIN=cerebras,groq,gemini,ollama to lead with the faster 70b twin.
+LLM_CHAIN = [s.strip().lower() for s in os.getenv(
+    "LLM_CHAIN", "groq,cerebras,gemini,ollama").split(",") if s.strip()]
+
+# Circuit-breaker cooldowns (seconds). When a provider 429s WITH a Retry-After
+# header we honor that exact reset time; these are the fallbacks when it doesn't.
+# A transient failure (rate limit w/o header, network, 5xx) parks the provider
+# briefly; a fatal one (bad key, malformed request) parks it long so we don't
+# re-hit a guaranteed-failing call every single turn.
+LLM_FALLBACK_COOLDOWN = float(os.getenv("LLM_FALLBACK_COOLDOWN", "30"))
+LLM_FATAL_COOLDOWN = float(os.getenv("LLM_FATAL_COOLDOWN", "3600"))
+
+# After this many seconds of silence, idly re-probe any higher-priority provider
+# whose cooldown has elapsed, so the NEXT thing the user says already routes to the
+# best available brain — without making them eat a failed call on their own turn.
+LLM_REPROBE_IDLE_SECONDS = float(os.getenv("LLM_REPROBE_IDLE_SECONDS", "10"))
 
 # How many recent conversation messages (user+assistant) to keep in the prompt each
 # call. The system message (persona + memory) is ALWAYS kept; only older in-session
