@@ -472,6 +472,7 @@ def _listener_loop_inner(callback) -> None:
                     pre_buffer = []
                     silence_count = 0
                     assert req is not None
+                    req.mark_speech_end()  # anchor for the felt reply latency
                     tag = "audio" if ended_on_silence else "max-dur"
                     req.event("vad-utterance-end", f"{tag} {audio_sec:.2f}s")
                     if len(audio) >= MIN_AUDIO_SAMPLES:

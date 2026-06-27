@@ -216,7 +216,9 @@ def _run_pipeline(req: Request, text: str) -> None:
                 req.event("tts-sentence", f"{fmt_dur(tts_dur)} '{preview}'")
                 if audio_bytes and not cancel.is_set():
                     if not first_audio_logged:
-                        req.event("first-audio-ready", fmt_dur(req.t()))
+                        req.event("first-audio-ready",
+                                  f"{fmt_dur(req.reply_t())} after you stopped "
+                                  f"(t+{fmt_dur(req.t())} from speech start)")
                         first_audio_logged = True
                     wav_dur = _wav_duration(audio_bytes)
                     stt.extend_speaker_busy(wav_dur)
@@ -283,7 +285,9 @@ def _run_pipeline(req: Request, text: str) -> None:
             else:
                 _window.evaluate_js("endTarsStream()")
 
-        req.event("pipeline-total", fmt_dur(req.t()))
+        req.event("pipeline-total",
+                  f"{fmt_dur(req.reply_t())} since you stopped "
+                  f"(t+{fmt_dur(req.t())} from speech start)")
         response = full_response.strip()
         if response:
             print(f"[TARS req={req.id}] {response}")

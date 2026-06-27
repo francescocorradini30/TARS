@@ -44,7 +44,7 @@ class Phase:
 
 
 class Request:
-    __slots__ = ("id", "t0", "barged_in")
+    __slots__ = ("id", "t0", "barged_in", "speech_end")
 
     def __init__(self) -> None:
         self.id = _next_id()
@@ -52,9 +52,21 @@ class Request:
         # Set True by the rolling wake-word check when this utterance interrupts
         # TARS mid-response, so _process_utterance always answers the full prompt.
         self.barged_in = False
+        # Stamped when the user STOPS talking (vad-utterance-end). t() measures from
+        # speech START — so for a long utterance it mostly counts how long the user
+        # spoke, not how responsive TARS was. reply_t() is the latency they actually
+        # feel: from when they stopped to now.
+        self.speech_end: float | None = None
 
     def t(self) -> float:
         return time.perf_counter() - self.t0
+
+    def mark_speech_end(self) -> None:
+        self.speech_end = time.perf_counter()
+
+    def reply_t(self) -> float:
+        base = self.speech_end if self.speech_end is not None else self.t0
+        return time.perf_counter() - base
 
     def event(self, name: str, msg: str = "") -> None:
         tail = f" — {msg}" if msg else ""

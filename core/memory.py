@@ -33,6 +33,7 @@ import numpy as np
 from config import (
     MEMORY_DB_PATH, PROFILE_PATH, USER_NAME,
     CONSOLIDATION_BACKEND, GROQ_API_KEY, GROQ_MODEL,
+    CEREBRAS_API_KEY, CEREBRAS_MODEL, GEMINI_API_KEY, GEMINI_MODEL, LLM_CHAIN,
     OLLAMA_MODEL, OLLAMA_BASE_URL,
     MEMORY_RECENT_SESSIONS, MEMORY_MAX_FACTS,
     MEMORY_DECAY_BASE, MEMORY_MIN_SALIENCE, MEMORY_STORE_MIN_SALIENCE,
@@ -844,36 +845,63 @@ it. Add new durable traits. Keep each entry a short phrase. Don't duplicate.
 """
 
 
-def _chat_json(system: str, user: str) -> dict:
-    """One JSON-returning chat call on the configured consolidation backend (groq
-    default, ollama local). Shared by the consolidation + compaction passes."""
-    if CONSOLIDATION_BACKEND == "ollama":
+# OpenAI-compatible cloud backends usable for the JSON consolidation pass (same
+# endpoints as the conversation chain in core/llm.py). Each: (base_url, key, model).
+_CONSOLIDATION_OPENAI = {
+    "groq":     ("https://api.groq.com/openai/v1",                           GROQ_API_KEY,     GROQ_MODEL),
+    "cerebras": ("https://api.cerebras.ai/v1",                               CEREBRAS_API_KEY, CEREBRAS_MODEL),
+    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai/", GEMINI_API_KEY,   GEMINI_MODEL),
+}
+
+
+def _chat_json_one(backend: str, system: str, user: str) -> dict:
+    """One JSON-returning chat call on a specific backend. Raises on failure so the
+    caller can fall through to the next backend."""
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    if backend == "ollama":
         import ollama
         client = ollama.Client(host=OLLAMA_BASE_URL)
-        resp = client.chat(
-            model=OLLAMA_MODEL, format="json",
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            options={"temperature": 0.2},
-        )
-        raw = resp["message"]["content"]
-    else:
-        if not GROQ_API_KEY:
-            raise RuntimeError(
-                "CONSOLIDATION_BACKEND=groq but GROQ_API_KEY is empty. Add it to .env "
-                "or set CONSOLIDATION_BACKEND=ollama for fully-local consolidation."
-            )
-        from groq import Groq
-        client = Groq(api_key=GROQ_API_KEY)
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-        raw = resp.choices[0].message.content
-    return json.loads(raw)
+        resp = client.chat(model=OLLAMA_MODEL, format="json",
+                           messages=messages, options={"temperature": 0.2})
+        return json.loads(resp["message"]["content"])
+    base_url, api_key, model = _CONSOLIDATION_OPENAI[backend]
+    if not api_key:
+        raise RuntimeError(f"consolidation backend '{backend}' has no API key")
+    from openai import OpenAI
+    # Off the hot path (shutdown/startup), so a generous timeout is fine; max_retries=0
+    # so a rate-limited provider fails straight to the next instead of backing off.
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0, max_retries=0)
+    resp = client.chat.completions.create(
+        model=model, messages=messages, temperature=0.2,
+        response_format={"type": "json_object"})
+    return json.loads(resp.choices[0].message.content)
+
+
+def _chat_json(system: str, user: str) -> dict:
+    """JSON consolidation call with FAILOVER. Tries the configured backend first, then
+    the rest of the LLM chain, always ending at local ollama — so a finished session is
+    distilled even when every cloud free tier is rate-limited (the bug that silently
+    dropped a whole session of memories when Groq's daily token limit was hit). Shared
+    by the consolidation + compaction passes."""
+    order = [CONSOLIDATION_BACKEND]
+    order += [b for b in LLM_CHAIN if b not in order]
+    if "ollama" not in order:
+        order.append("ollama")  # local floor: no rate limit, always available
+    last_err = None
+    for backend in order:
+        if backend in _CONSOLIDATION_OPENAI and not _CONSOLIDATION_OPENAI[backend][1]:
+            continue  # cloud backend with no key — skip
+        try:
+            result = _chat_json_one(backend, system, user)
+            if backend != order[0]:
+                print(f"[MEMORY] consolidation served via fallback: {backend}")
+            return result
+        except Exception as e:
+            last_err = e
+            print(f"[MEMORY] consolidation backend '{backend}' failed: "
+                  f"{type(e).__name__}: {str(e)[:120]}")
+    raise last_err if last_err else RuntimeError("no consolidation backend available")
 
 
 def _consolidation_llm(transcript: str, current_profile: dict) -> dict:

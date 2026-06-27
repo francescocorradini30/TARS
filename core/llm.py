@@ -181,9 +181,14 @@ class _Provider:
         if self._client is None:
             if self.kind == "openai":
                 from openai import OpenAI
-                # Short timeout: a hung cloud call must fail FAST so we fall through to
-                # the next provider instead of stalling a live voice turn.
-                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=20.0)
+                # timeout: a hung cloud call must fail FAST so we fall through to the
+                # next provider instead of stalling a live voice turn.
+                # max_retries=0 is critical: the SDK's default internal retries (with
+                # backoff) would silently sit on a throttled provider for tens of
+                # seconds, holding the pipeline lock — OUR circuit-breaker chain IS the
+                # retry mechanism, so the SDK must fail immediately to the next link.
+                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                                      timeout=20.0, max_retries=0)
             else:
                 self._client = ollama.Client(host=self.base_url or OLLAMA_BASE_URL)
         return self._client
