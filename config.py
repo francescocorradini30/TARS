@@ -60,6 +60,17 @@ LLM_REPROBE_IDLE_SECONDS = float(os.getenv("LLM_REPROBE_IDLE_SECONDS", "10"))
 # dropping old turns isn't "forgetting". 24 ≈ 12 back-and-forth exchanges.
 CHAT_HISTORY_MESSAGES = int(os.getenv("CHAT_HISTORY_MESSAGES", "24"))
 
+# --- Tool calling (the action "rail") ---------------------------------------
+# Lets TARS *do* things, not just talk: the model can call registered tools (see
+# core/tools.py) and speak around the result. The cost is kept near-zero by only
+# offering a tool's schema on turns whose text trips its triggers, so a normal
+# chat turn ships no tools and the token budget is unchanged. Tools only fire on
+# the OpenAI-compatible cloud providers; on a fallback to the local Ollama 3b they
+# silently don't (the small model isn't reliable at it) and TARS just answers.
+# Set false to disable the whole rail (pure conversation, like before tools).
+TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 

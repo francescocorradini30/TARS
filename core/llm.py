@@ -41,8 +41,9 @@ from config import (
     OLLAMA_MODEL, OLLAMA_BASE_URL, SYSTEM_PROMPT, DATA_DIR,
     GROQ_API_KEY, GROQ_MODEL, CEREBRAS_API_KEY, CEREBRAS_MODEL,
     GEMINI_API_KEY, GEMINI_MODEL, LLM_CHAIN, CHAT_HISTORY_MESSAGES,
-    LLM_FALLBACK_COOLDOWN, LLM_FATAL_COOLDOWN,
+    LLM_FALLBACK_COOLDOWN, LLM_FATAL_COOLDOWN, TOOLS_ENABLED,
 )
+from core.tools import registry as tool_registry
 
 # OpenAI-compatible base URLs. Groq/Cerebras/Gemini all speak the OpenAI chat API,
 # so one SDK drives all three — the only per-provider difference is url + key + model.
@@ -215,6 +216,38 @@ class _Provider:
                 if c:
                     yield c
 
+    def stream_events(self, messages: list[dict], tools: list[dict]) -> Iterator[tuple]:
+        """Tool-aware sibling of stream(). Instead of bare text it yields tagged events:
+          ('text', delta)   — a chunk of the spoken answer, streamed as it arrives
+          ('calls', [ ... ]) — emitted once at the end IF the model asked to call tools,
+                               each entry {'id','name','arguments'} with arguments as the
+                               raw (possibly fragmented-then-joined) JSON string.
+        OpenAI streams a tool call as deltas with no content, so we accumulate the
+        fragments by index. The Ollama branch is text-only on purpose: the local 3b
+        isn't trustworthy at tool calls, so offline they just never fire."""
+        if self.kind == "openai":
+            s = self.client().chat.completions.create(
+                model=self.model, messages=messages, stream=True,
+                max_tokens=400, tools=tools)
+            acc: dict[int, dict] = {}  # tool_call index -> assembled {id,name,arguments}
+            for chunk in s:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield ("text", delta.content)
+                for tc in (delta.tool_calls or []):
+                    slot = acc.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        slot["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        slot["arguments"] += tc.function.arguments
+            if acc:
+                yield ("calls", [acc[i] for i in sorted(acc)])
+        else:
+            for c in self.stream(messages):
+                yield ("text", c)
+
     def probe(self) -> None:
         """Tiny 1-token call to check the provider is actually back. Raises on failure.
         A 429 here costs no real quota (rejected); a success means it's live again."""
@@ -346,7 +379,7 @@ class TARSBrain:
                         + (" +recall" if (recalled or '').strip() else ""))
         full_text: list[str] = []
         try:
-            for delta in self._stream_failover(messages, log):
+            for delta in self._stream_reply(messages, message, log):
                 full_text.append(delta)
                 yield delta
         finally:
@@ -374,11 +407,83 @@ class TARSBrain:
                 {"role": "system", "content": recalled}, messages[-1]]
         return messages
 
-    def _stream_failover(self, messages: list[dict], log=None) -> Iterator[str]:
+    # -- the tool "rail" ------------------------------------------------------
+    def _stream_reply(self, messages: list[dict], user_text: str, log=None) -> Iterator[str]:
+        """Yield the spoken answer as text, transparently handling a tool round-trip.
+
+        This is the rail every TARS app rides. The flow:
+          1. Gate: offer only the tools whose triggers the user's words trip (usually
+             none → this collapses to a plain text turn, zero added cost).
+          2. First turn (tool-aware): stream it. If real text comes back, the model just
+             answered — relay it and we're done (no tool was needed).
+          3. If instead the model emitted tool call(s) and no text, run them locally and
+             do a SECOND, plain streamed turn feeding the results back, so TARS speaks
+             about the outcome. The tool turn itself produces NO audio (it's a machine
+             step) — which is exactly why it's invisible to the sentence-splitting TTS in
+             main.py: the caller only ever sees the spoken text deltas.
+
+        The tool-plumbing messages (the assistant tool_call + the tool results) are used
+        only for this turn's second call; they are NOT added to self.history, keeping the
+        long-term transcript clean — the same way recall is injected ephemerally."""
+        tools = tool_registry.relevant(user_text) if TOOLS_ENABLED else []
+        if not tools:
+            yield from self._stream_failover(messages, log)
+            return
+        self._log_event(log, "tools-offered",
+                        ", ".join(t["function"]["name"] for t in tools))
+        got_text = False
+        calls = None
+        for kind, payload in self._stream_failover(
+                messages, log, make_gen=lambda p: p.stream_events(messages, tools)):
+            if kind == "text":
+                got_text = True
+                yield payload
+            elif kind == "calls":
+                calls = payload
+        # If the model spoke (with or without also requesting a tool), take the spoken
+        # answer and stop — we don't second-guess a model that already replied. A pure
+        # tool turn (calls, no text) is the one that triggers the execute + speak round-trip.
+        if not calls or got_text:
+            return
+        tool_msgs = self._run_tool_calls(calls, log)
+        assistant_msg = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": c["id"], "type": "function",
+                            "function": {"name": c["name"],
+                                         "arguments": c["arguments"] or "{}"}}
+                           for c in calls]}
+        followup = messages + [assistant_msg] + tool_msgs
+        yield from self._stream_failover(followup, log)
+
+    def _run_tool_calls(self, calls: list[dict], log=None) -> list[dict]:
+        """Execute each requested tool via the whitelist registry and package the
+        results as OpenAI 'tool' messages for the follow-up call. Dispatch never
+        raises (the registry returns an error string), so one bad tool can't drop
+        the voice turn."""
+        msgs = []
+        for c in calls:
+            try:
+                args = json.loads(c["arguments"]) if c["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {}
+            result = tool_registry.dispatch(c["name"], args)
+            self._log_event(log, "tool-call",
+                            f"{c['name']}({c['arguments'] or '{}'}) -> {result[:80]}")
+            msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+        return msgs
+
+    def _stream_failover(self, messages: list[dict], log=None, make_gen=None) -> Iterator:
         """Walk the chain top-to-bottom: try each available provider, fall through on a
         pre-first-token failure, commit to the first one that yields. Once we've started
         streaming we don't fail over (we're already speaking) — a mid-stream drop just
-        ends the partial answer cleanly. Every decision is logged via `log`."""
+        ends the partial answer cleanly. Every decision is logged via `log`.
+
+        `make_gen(prov)` is the per-provider generator factory; it defaults to plain text
+        streaming (prov.stream) but the tool path passes prov.stream_events instead. The
+        failover logic only cares that the first next() either errors (→ fall through) or
+        yields (→ commit), so it's agnostic to whether items are text strings or tagged
+        tuples — it just relays them."""
+        make_gen = make_gen or (lambda prov: prov.stream(messages))
         now = _now()
         last_kind = "none"
         for prov in self.providers:
@@ -388,7 +493,7 @@ class TARSBrain:
                                 f"{prov.open_until.strftime('%H:%M:%S')}")
                 continue
             was_down = prov.open_until is not None  # tentatively-recovered (cooldown elapsed)
-            gen = prov.stream(messages)
+            gen = make_gen(prov)
             try:
                 first = next(gen)
             except StopIteration:
