@@ -96,6 +96,18 @@ STT_DEVICE_PRIORITY = [
 # log — silence should sit comfortably below this).
 STT_ENERGY_THRESHOLD = float(os.getenv("STT_ENERGY_THRESHOLD", "0.012"))
 
+# How long a silence must last to END an utterance, in ms. This is the tolerance for
+# mid-sentence pauses: too low and a natural breath/thinking pause ships a fragment and
+# cuts the speaker off mid-thought; too high and TARS feels laggy to reply (this delay
+# is added to every turn after you stop talking). Tune by voice on a clean mic. ~1.2s
+# rides out most natural pauses while staying responsive.
+STT_SILENCE_MS = int(os.getenv("STT_SILENCE_MS", "1200"))
+
+# Hard cap (seconds) on a single utterance even if no silence is detected — a safety
+# net against a mic that never goes quiet. Also the ceiling on one uninterrupted
+# monologue: raise it if you tell long stories without pausing and get cut at the cap.
+STT_MAX_UTTERANCE_S = float(os.getenv("STT_MAX_UTTERANCE_S", "20"))
+
 USER_NAME = os.getenv("USER_NAME", "Cooper")
 
 # --- Persistent memory (local-only) -----------------------------------------

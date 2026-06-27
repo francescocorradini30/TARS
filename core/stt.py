@@ -6,23 +6,23 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 from config import (
     WHISPER_MODEL, WHISPER_DEVICE, STT_INPUT_DEVICE, STT_ENERGY_THRESHOLD,
-    STT_DEVICE_PRIORITY,
+    STT_DEVICE_PRIORITY, STT_SILENCE_MS, STT_MAX_UTTERANCE_S,
 )
 from core.log import Request
 
 SAMPLE_RATE       = 16000
 CHUNK_SAMPLES     = 512
 ENERGY_THRESHOLD  = STT_ENERGY_THRESHOLD   # see config.py / .env (STT_ENERGY_THRESHOLD)
-SILENCE_CHUNKS    = 26            # ~0.83s of silence ends an utterance — long
-                                  # enough to ride out natural mid-sentence
-                                  # pauses (thinking, breath, soft phonemes)
-                                  # so we don't ship a fragment and cut the user
-                                  # off. Lower = snappier turns but more cutoffs.
+# Silence needed to end an utterance, in chunks (STT_SILENCE_MS in config/.env).
+# Long enough to ride out natural mid-sentence pauses (thinking, breath, soft
+# phonemes) so we don't ship a fragment and cut the user off. Lower = snappier turns
+# but more cutoffs; higher = fewer cutoffs but a longer wait before TARS replies.
+SILENCE_CHUNKS    = max(1, round(STT_SILENCE_MS / 1000 * SAMPLE_RATE / CHUNK_SAMPLES))
 PRE_ROLL_CHUNKS   = 10            # ~0.32s pre-roll
 MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * 0.35)
-MAX_UTTERANCE_CHUNKS = int(SAMPLE_RATE * 12 / CHUNK_SAMPLES)  # force-end after
-                                  # ~12s even without silence, so a runaway blob
-                                  # (mic never goes quiet) still gets processed.
+# Force-end after STT_MAX_UTTERANCE_S even without silence, so a runaway blob (mic
+# never goes quiet) still gets processed — and so one long monologue isn't cut short.
+MAX_UTTERANCE_CHUNKS = int(SAMPLE_RATE * STT_MAX_UTTERANCE_S / CHUNK_SAMPLES)
 
 # Mid-speech barge-in: while TARS is talking, periodically transcribe a short
 # rolling window of the in-progress utterance and fire the interrupt the instant
