@@ -2,7 +2,7 @@ import ollama
 from typing import Iterator
 from config import (
     OLLAMA_MODEL, OLLAMA_BASE_URL, SYSTEM_PROMPT,
-    LLM_BACKEND, GROQ_API_KEY, GROQ_MODEL,
+    LLM_BACKEND, GROQ_API_KEY, GROQ_MODEL, CHAT_HISTORY_MESSAGES,
 )
 
 
@@ -59,15 +59,22 @@ class TARSBrain:
 
     def chat_stream(self, message: str, recalled: str = "") -> Iterator[str]:
         self.history.append({"role": "user", "content": message})
+        # Send the system message (persona + memory) + only the last
+        # CHAT_HISTORY_MESSAGES turns, so per-call token cost stays flat instead of
+        # growing with the session. The full history stays in self.history (cheap, in
+        # RAM); we just cap what's sent to the model. What falls out of the window is
+        # not lost long-term — it's carried by the memory block + recall.
+        convo = self.history[1:]
+        if len(convo) > CHAT_HISTORY_MESSAGES:
+            convo = convo[-CHAT_HISTORY_MESSAGES:]
+        messages = [self.history[0]] + convo
         # Associative recall is per-turn and topic-specific, so it's injected as an
         # ephemeral system note right before this user message — only into THIS API
         # call, never stored in history. That keeps the conversation log clean and lets
         # the recalled set follow the topic instead of piling up across turns.
         if recalled.strip():
-            messages = self.history[:-1] + [
-                {"role": "system", "content": recalled}, self.history[-1]]
-        else:
-            messages = self.history
+            messages = messages[:-1] + [
+                {"role": "system", "content": recalled}, messages[-1]]
         full_text: list[str] = []
         stream = self._stream_groq if self.backend == "groq" else self._stream_ollama
         try:

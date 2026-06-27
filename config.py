@@ -13,6 +13,15 @@ LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").strip().lower()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
+# How many recent conversation messages (user+assistant) to keep in the prompt each
+# call. The system message (persona + memory) is ALWAYS kept; only older in-session
+# turns are dropped. The LLM is stateless — every turn re-sends the whole history — so
+# without a cap the per-call token cost grows with the session (quadratic burn), which
+# is what blows the daily token limit. Capping it keeps cost flat. Long-term memory is
+# carried by the injected memory block + semantic recall, NOT the raw transcript, so
+# dropping old turns isn't "forgetting". 24 ≈ 12 back-and-forth exchanges.
+CHAT_HISTORY_MESSAGES = int(os.getenv("CHAT_HISTORY_MESSAGES", "24"))
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 

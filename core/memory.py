@@ -117,6 +117,13 @@ def _profile_texts(profile: dict) -> dict:
     return {k: [e["text"] for e in (profile.get(k) or [])] for k in _EMPTY_PROFILE}
 
 
+# How many of the current session's turns to keep recall-able in memory at once.
+# One float32[384] per turn (~1.5KB), so even a marathon session is trivial; the cap
+# just bounds a runaway. These are ephemeral (this process only) — the raw turns are
+# already journaled and become proper memories at consolidation.
+_SESSION_RECALL_CAP = 200
+
+
 class MemoryStore:
     def __init__(self, db_path: str = MEMORY_DB_PATH, profile_path: str = PROFILE_PATH):
         self.db_path = db_path
@@ -127,6 +134,11 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
         self.session_id: int | None = None  # set by start_session()
+        # Live recall of the CURRENT session: (turn_text, embedding) for what the user
+        # has said this session, so it can be associatively recalled even after it
+        # scrolls out of the trimmed chat history. Reuses the embedding recall_relevant
+        # already computes, so it costs nothing extra. Reset each session.
+        self._session_vectors: list[tuple] = []
 
     # -- schema ---------------------------------------------------------------
     def _init_schema(self) -> None:
@@ -183,6 +195,7 @@ class MemoryStore:
             )
             self._conn.commit()
             self.session_id = cur.lastrowid
+        self._session_vectors = []  # fresh session = fresh live-recall cache
         return {"id": self.session_id, "started_at": ts}
 
     def log_turn(self, role: str, content: str) -> None:
@@ -387,6 +400,7 @@ class MemoryStore:
             ).fetchall()
             prof_rows = self._conn.execute(
                 "SELECT text, embedding FROM profile_vectors").fetchall()
+            sess = list(self._session_vectors)  # snapshot BEFORE adding this turn
 
         scored = []  # (sim, source, mem_id, kind, text)
         for r in mem_rows:
@@ -395,6 +409,16 @@ class MemoryStore:
         for r in prof_rows:
             v = np.frombuffer(r["embedding"], dtype=np.float32)
             scored.append((float(qv @ v), "prof", None, "identity", r["text"]))
+        for text, v in sess:
+            scored.append((float(qv @ v), "sess", None, "session", text))
+
+        # Remember THIS turn so later turns can recall it even after it scrolls out of
+        # the trimmed chat history. Reuses the query embedding above — no extra cost.
+        # Snapshot was taken before this append, so the turn never matches itself.
+        with self._lock:
+            self._session_vectors.append((query.strip(), qv))
+            if len(self._session_vectors) > _SESSION_RECALL_CAP:
+                del self._session_vectors[:-_SESSION_RECALL_CAP]
 
         scored.sort(key=lambda x: x[0], reverse=True)
         picked = [s for s in scored if s[0] >= MEMORY_RECALL_MIN_SIM][:max(1, k)]
@@ -414,7 +438,12 @@ class MemoryStore:
         lines = ["(What they just said stirs these specific memories — only bring one up "
                  "if it actually fits, and never announce that you're 'recalling' anything:)"]
         for _sim, source, _id, kind, text in picked:
-            label = _KIND_LABELS.get(kind, "note") if source == "mem" else "about them"
+            if source == "mem":
+                label = _KIND_LABELS.get(kind, "note")
+            elif source == "sess":
+                label = "they said earlier"
+            else:
+                label = "about them"
             lines.append(f"- ({label}) {text}")
         return "\n".join(lines)
 
