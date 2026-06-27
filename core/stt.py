@@ -1,7 +1,6 @@
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -148,7 +147,6 @@ _barge_model: WhisperModel | None = None  # separate instance for barge checks
 _model_load_lock = threading.Lock()
 _running: bool     = False
 _transcribing: bool = False   # True only during Whisper inference
-_transcribe_pool = ThreadPoolExecutor(max_workers=2)
 
 # Latest-wins STT queue. While Whisper is busy on one utterance, a newly finished
 # utterance isn't dropped — it's stashed here and run as soon as the current
@@ -252,6 +250,22 @@ def _transcribe(audio: np.ndarray, language: str,
     return text, score
 
 
+def _detect_lang(audio: np.ndarray) -> tuple[float, float]:
+    """Acoustic language ID from the audio alone — "do these sounds belong to English
+    or Italian?" — with NO transcription/translation to skew it. Replaces the old
+    forced-Italian transcribe in the addressee gate (that pass sometimes TRANSLATED the
+    English and won on confidence, wrongly dropping English). Returns (P(en), P(it)).
+    Best-effort: on any failure returns (1.0, 0.0) so we default to treating speech as
+    English (addressed to TARS) rather than silently dropping it."""
+    try:
+        _, _, all_probs = _get_model().detect_language(audio)
+    except Exception as e:
+        print(f"[STT] detect_language failed ({type(e).__name__}: {e}) — assuming English")
+        return 1.0, 0.0
+    d = dict(all_probs)
+    return float(d.get("en", 0.0)), float(d.get("it", 0.0))
+
+
 def _transcribe_fast(audio: np.ndarray) -> str:
     """Single-pass, greedy English transcription used only for mid-speech
     wake-word detection. Runs on the dedicated lightweight model so it never
@@ -328,28 +342,24 @@ def _release_or_chain(callback) -> None:
 
 
 def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
-    # Is this utterance aimed at TARS by *context* rather than by the language gate?
-    # Two cases: a confirmed mid-speech barge-in, or speech captured while TARS was
-    # still talking. In both, the WAKE WORD decides — not the en/it comparison — so
-    # the Italian pass is dead weight. Skipping it halves transcription latency on
-    # exactly the path that hurts most: cutting TARS off to say something new.
+    # The content is ALWAYS the forced-English transcription (TARS only acts on English).
+    # The addressee decision — are you talking to TARS? — comes from ACOUSTIC language ID
+    # (do these sounds fit English or Italian?), NOT from a second forced-Italian
+    # transcription. That old second pass could TRANSLATE your English into fluent Italian
+    # and win on confidence, wrongly dropping you. When the addressee is already settled
+    # by context (barge-in / speaker active), the wake word decides and we skip the lang
+    # check. detect_language is also cheaper than a full second transcribe (~275 vs ~380ms
+    # on turbo here), so the idle path is faster than the old dual-transcribe too.
     directed = req.barged_in or speaker_active()
     try:
         with req.phase("stt-transcribe") as p:
-            # faster_whisper releases the GIL during ctranslate2 inference, so the
-            # en/it passes overlap when we actually need both.
-            en_future = _transcribe_pool.submit(_transcribe, audio, 'en', HOTWORDS)
+            en_text, en_score = _transcribe(audio, 'en', HOTWORDS)
             if directed:
-                # English-only: the addressee is already settled, so don't pay for
-                # the Italian pass (which on a single GPU serializes behind en).
-                en_text, en_score = en_future.result()
-                it_text, it_score = "", -10.0
-                p.note(f"en={en_score:.2f} '{en_text}' | it=skipped (directed)")
+                p_en, p_it = 1.0, 0.0  # unused on the directed path; the wake word decides
+                p.note(f"en={en_score:.2f} '{en_text}' | lang=skipped (directed)")
             else:
-                it_future = _transcribe_pool.submit(_transcribe, audio, 'it')
-                en_text, en_score = en_future.result()
-                it_text, it_score = it_future.result()
-                p.note(f"en={en_score:.2f} '{en_text}' | it={it_score:.2f} '{it_text}'")
+                p_en, p_it = _detect_lang(audio)
+                p.note(f"en={en_score:.2f} '{en_text}' | P(en)={p_en:.2f} P(it)={p_it:.2f}")
     finally:
         # Free / hand off the Whisper gate the instant inference is done — BEFORE
         # running the (potentially multi-second) LLM+TTS pipeline via callback().
@@ -359,23 +369,14 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
         # _release_or_chain also picks up any utterance queued while we were busy.
         _release_or_chain(callback)
 
-    if not en_text and not it_text:
-        req.event("drop", "whisper VAD rejected (both transcripts empty)")
+    if not en_text:
+        req.event("drop", "whisper VAD rejected (empty transcript)")
         return
 
-    if _is_noise(en_text) and _is_noise(it_text):
-        req.event("drop", "noise hallucination in both languages")
-        return
-    if _is_noise(it_text) and it_score >= en_score:
-        req.event("drop", "noise hallucination (it wins)")
-        return
-
-    has_wake = bool(en_text and WAKE_RE.search(en_text) and not _is_noise(en_text))
-    # Reuse the up-front context decision: if we treated this as directed-at-TARS
-    # (single English pass), the accept/drop branch must agree. Recomputing
-    # speaker_active() here could flip False mid-call (TARS's audio just ended) and
-    # send a wake-word-less, English-only utterance into the idle gate with a bogus
-    # it_score — so anchor to the same flag instead.
+    has_wake = bool(WAKE_RE.search(en_text) and not _is_noise(en_text))
+    # Reuse the up-front context decision: if we treated this as directed-at-TARS, the
+    # accept/drop branch must agree. Recomputing speaker_active() here could flip False
+    # mid-call (TARS's audio just ended), so anchor to the same flag instead.
     busy = directed
 
     def _accept_barge(reason: str) -> None:
@@ -405,23 +406,22 @@ def _process_utterance(req: Request, audio: np.ndarray, callback) -> None:
             req.event("drop", "speaker active without wake word")
         return
 
-    # Idle: normal addressee gate — English = talking to TARS, Italian = ignore.
-    # But if the English transcript carries the wake word, the user is clearly
-    # addressing TARS — accept regardless of how the en/it logprobs landed. This is
-    # the documented WAKE_RE tiebreaker, which was previously only wired into the
-    # busy/barge-in path: a short "hey TARS" that scored marginally better as
-    # Italian got wrongly dropped here.
+    # Idle: acoustic addressee gate. The wake word always gets you in.
     if has_wake:
         req.event("accept", "wake word (idle tiebreaker)")
         callback(en_text, req)
         return
-    if it_score > en_score:
-        req.event("drop", f"it wins (en={en_score:.2f} it={it_score:.2f})")
+    if _is_noise(en_text):
+        req.event("drop", "noise hallucination")
         return
-    if not en_text or _is_noise(en_text):
-        req.event("drop", "en empty or noise")
+    # Decide by which language the SOUNDS fit, not by comparing forced-English vs a
+    # forced-Italian transcription (the Italian pass could TRANSLATE the English and win,
+    # wrongly dropping you). Drop only when Italian clearly wins the acoustic call, so
+    # accented English that sits closer to the line still gets through.
+    if p_it > p_en:
+        req.event("drop", f"italian speech (P(en)={p_en:.2f} P(it)={p_it:.2f})")
         return
-    req.event("accept")
+    req.event("accept", f"english speech (P(en)={p_en:.2f} P(it)={p_it:.2f})")
     callback(en_text, req)
 
 
